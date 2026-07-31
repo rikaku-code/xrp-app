@@ -136,6 +136,24 @@ class PlanStep:
     trigger_label: str
     amount_desc: str
     result_desc: str
+    amount_jpy: float = 0.0
+    amount_xrp: float = 0.0
+
+
+@dataclass(frozen=True)
+class CurrentAction:
+    """刷新时刻应执行（或等待）的操作。"""
+
+    action: str
+    title: str
+    reason: str
+    buy_jpy: float
+    buy_xrp: float
+    sell_xrp: float
+    sell_jpy: float
+    next_buy_price: float | None
+    next_sell_price: float | None
+    trigger_price: float | None
 
 
 @dataclass(frozen=True)
@@ -522,6 +540,8 @@ def build_recovery_plan(
                     f"预计总资产 {fmt_jpy(after.total_assets(trigger))} · "
                     f"距目标还差 {fmt_jpy(portfolio.target_jpy - after.total_assets(trigger))}"
                 ),
+                amount_jpy=amount,
+                amount_xrp=amount / trigger if trigger > 0 else 0.0,
             )
         )
 
@@ -547,6 +567,8 @@ def build_recovery_plan(
                     f"剩余 {after.xrp_quantity:,.0f} XRP · "
                     f"总资产 {fmt_jpy(after.total_assets(trigger))}"
                 ),
+                amount_jpy=proceeds,
+                amount_xrp=sell_qty,
             )
         )
 
@@ -691,6 +713,98 @@ def generate_trade_advice(
         )
 
     return advice
+
+
+def build_current_action(
+    snapshot: MarketSnapshot,
+    portfolio: Portfolio,
+    plan: RecoveryPlan,
+) -> CurrentAction:
+    p = snapshot.price
+    rsi = snapshot.daily_rsi
+    dca_jpy = plan.dca_buy_jpy
+    next_buy = plan.buy_steps[0] if plan.buy_steps else None
+    next_sell = plan.sell_steps[0] if plan.sell_steps else None
+    nb = next_buy.trigger_price if next_buy else None
+    ns = next_sell.trigger_price if next_sell else None
+
+    if rsi < DAILY_RSI_EXTREME and at_30d_low(snapshot) and dca_jpy > 0:
+        return CurrentAction(
+            action="买入",
+            title="极端超跌 · 执行低吸",
+            reason=f"RSI {rsi:.1f}，价格 {fmt_jpy(p)} 贴近 30 日低点 {fmt_jpy(snapshot.low_30d)}",
+            buy_jpy=dca_jpy,
+            buy_xrp=dca_jpy / p if p > 0 else 0.0,
+            sell_xrp=0.0,
+            sell_jpy=0.0,
+            next_buy_price=nb,
+            next_sell_price=ns,
+            trigger_price=p,
+        )
+
+    if rsi < RSI_OVERSOLD and p <= snapshot.bb_lower * 1.02 and dca_jpy > 0:
+        half = dca_jpy / 2
+        return CurrentAction(
+            action="买入",
+            title="超卖区 · 小仓试探",
+            reason=f"RSI {rsi:.1f}，价格接近布林带下轨 {fmt_jpy(snapshot.bb_lower)}",
+            buy_jpy=half,
+            buy_xrp=half / p if p > 0 else 0.0,
+            sell_xrp=0.0,
+            sell_jpy=0.0,
+            next_buy_price=nb,
+            next_sell_price=ns,
+            trigger_price=p,
+        )
+
+    if rsi >= RSI_OVERBOUGHT and p >= snapshot.ma20:
+        sell_qty = portfolio.xrp_quantity * SWING_SELL_FRACTION
+        return CurrentAction(
+            action="卖出",
+            title="超买反弹 · 分批高抛",
+            reason=f"RSI {rsi:.1f}，价格 {fmt_jpy(p)} 高于 MA20 {fmt_jpy(snapshot.ma20)}",
+            buy_jpy=0.0,
+            buy_xrp=0.0,
+            sell_xrp=sell_qty,
+            sell_jpy=sell_qty * p,
+            next_buy_price=nb,
+            next_sell_price=ns,
+            trigger_price=p,
+        )
+
+    for step in plan.sell_steps[:2]:
+        if p >= step.trigger_price * 0.98:
+            return CurrentAction(
+                action="卖出",
+                title=f"接近 {step.trigger_label}",
+                reason=f"价格 {fmt_jpy(p)} 逼近卖出位 {fmt_jpy(step.trigger_price)}",
+                buy_jpy=0.0,
+                buy_xrp=0.0,
+                sell_xrp=step.amount_xrp,
+                sell_jpy=step.amount_jpy,
+                next_buy_price=nb,
+                next_sell_price=ns,
+                trigger_price=step.trigger_price,
+            )
+
+    wait_parts = []
+    if next_buy:
+        wait_parts.append(f"低吸 {fmt_jpy(next_buy.trigger_price)}")
+    if next_sell:
+        wait_parts.append(f"高抛 {fmt_jpy(next_sell.trigger_price)}")
+    wait_hint = " · ".join(wait_parts) if wait_parts else "按下方计划表执行"
+    return CurrentAction(
+        action="等待",
+        title="暂无操作 · 持有观望",
+        reason=f"RSI {rsi:.1f}，价格 {fmt_jpy(p)} · 关注 {wait_hint}",
+        buy_jpy=0.0,
+        buy_xrp=0.0,
+        sell_xrp=0.0,
+        sell_jpy=0.0,
+        next_buy_price=nb,
+        next_sell_price=ns,
+        trigger_price=None,
+    )
 
 
 def detect_signals(
@@ -856,6 +970,7 @@ def run_monitor_cycle(
     pf = portfolio or load_portfolio()
     snapshot, daily = build_snapshot()
     plan = build_recovery_plan(snapshot, pf)
+    current_action = build_current_action(snapshot, pf, plan)
     advice = generate_trade_advice(snapshot, pf, plan)
     signals = detect_signals(snapshot, pf, plan)
     push_results = push_signals(signals, snapshot, cd)
@@ -864,6 +979,7 @@ def run_monitor_cycle(
         "daily": daily,
         "portfolio": pf,
         "recovery_plan": plan,
+        "current_action": current_action,
         "advice": advice,
         "chart_data": build_chart_data(daily),
         "signals": signals,
