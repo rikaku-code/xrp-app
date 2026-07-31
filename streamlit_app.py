@@ -1,4 +1,4 @@
-"""XRP/JPY Streamlit 监控面板 — 120 万回本波段计划。"""
+"""XRP/JPY Streamlit 监控面板 — 回本波段计划。"""
 
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ ADVICE_STYLE = {
 
 SIGNAL_STYLE = {
     "extreme_oversold": ("success", "💡 极端超跌 · 低吸"),
-    "target_reached": ("warning", "🎉 120万达成"),
+    "target_reached": ("warning", "🎉 目标达成"),
 }
 
 
@@ -82,7 +82,7 @@ def render_portfolio(
     cols = st.columns(4)
     cols[0].metric("XRP 持仓", f"{portfolio.xrp_quantity:,.0f} 枚", monitor.fmt_jpy(portfolio.xrp_value(snapshot.price)))
     cols[1].metric("日元现金", monitor.fmt_jpy(portfolio.cash_jpy))
-    cols[2].metric("总资产", monitor.fmt_man(plan.total_assets), f"目标 {monitor.fmt_man(portfolio.target_jpy)}")
+    cols[2].metric("总资产", monitor.fmt_jpy(plan.total_assets), f"目标 {monitor.fmt_jpy(portfolio.target_jpy)}")
     cols[3].metric(
         "总盈亏",
         monitor.fmt_jpy(pnl),
@@ -92,13 +92,13 @@ def render_portfolio(
 
 
 def render_recovery_plan(plan: monitor.RecoveryPlan) -> None:
-    st.subheader("120 万回本进度")
+    st.subheader("回本进度")
     st.progress(
         plan.recovery_pct,
-        text=f"当前 {monitor.fmt_man(plan.total_assets)} / 目标 {monitor.fmt_man(plan.target_jpy)} · 还差 {monitor.fmt_man(plan.recovery_gap)}",
+        text=f"当前 {monitor.fmt_jpy(plan.total_assets)} / 目标 {monitor.fmt_jpy(plan.target_jpy)} · 还差 {monitor.fmt_jpy(plan.recovery_gap)}",
     )
     cols = st.columns(3)
-    cols[0].metric("下一目标", plan.next_milestone_label, f"还差 {monitor.fmt_man(plan.next_milestone - plan.total_assets)}")
+    cols[0].metric("下一目标", plan.next_milestone_label, f"还差 {monitor.fmt_jpy(plan.next_milestone - plan.total_assets)}")
     cols[1].metric("纯持有需涨至", monitor.fmt_jpy(plan.hold_only_price), "不含波段操作")
     cols[2].metric("单次波段预期", monitor.fmt_jpy(plan.swing_cycle_profit), f"基于 {monitor.fmt_jpy(plan.dca_buy_jpy)} 低吸 +12%")
 
@@ -192,7 +192,7 @@ def handle_push_results(push_results: list[dict]) -> None:
 
 
 def render_monitor_panel(refresh_seconds: int) -> None:
-    st.title("XRP/JPY · 120 万回本波段计划")
+    st.title("XRP/JPY · 回本波段计划")
 
     portfolio = get_portfolio()
 
@@ -251,7 +251,7 @@ def render_monitor_panel(refresh_seconds: int) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="XRP/JPY 120万回本", page_icon="📊", layout="wide")
+    st.set_page_config(page_title="XRP/JPY 回本监控", page_icon="📊", layout="wide")
     apply_streamlit_secrets()
     init_session_state()
 
@@ -274,7 +274,7 @@ def main() -> None:
             value=st.session_state.target_jpy,
             step=10000.0,
             format="%.0f",
-            help="原始投入总额，如 120 万",
+            help="原始投入总额",
         )
         pf = get_portfolio()
         st.caption(

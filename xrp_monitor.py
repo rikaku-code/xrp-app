@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""XRP/JPY 长期持仓监控 — 120 万回本波段计划。"""
+"""XRP/JPY 长期持仓监控 — 回本波段计划。"""
 
 import base64
 import hashlib
@@ -64,7 +64,7 @@ FEISHU_SECRET = os.getenv("FEISHU_SECRET", "")
 
 @dataclass(frozen=True)
 class Portfolio:
-    """当前资产：XRP 数量 + 现金 + 原始投入目标（120 万）。"""
+    """当前资产：XRP 数量 + 现金 + 原始投入目标。"""
 
     xrp_quantity: float
     cash_jpy: float
@@ -228,9 +228,9 @@ def suggest_dca_jpy(cash_jpy: float) -> float:
 def next_milestone(total_assets: float) -> tuple[float, str]:
     for milestone in RECOVERY_MILESTONES:
         if total_assets < milestone:
-            label = f"¥{milestone / 10_000:.0f}万"
-            return milestone, label
-    return RECOVERY_MILESTONES[-1], "¥120万（已达成）"
+            return milestone, fmt_jpy(milestone)
+    last = RECOVERY_MILESTONES[-1]
+    return last, f"{fmt_jpy(last)}（已达成）"
 
 
 COOLDOWN_FILE = os.path.join(
@@ -519,8 +519,8 @@ def build_recovery_plan(
                 trigger_label=f"{label}（{cond}）",
                 amount_desc=f"投入 {fmt_jpy(amount)}",
                 result_desc=(
-                    f"预计总资产 {fmt_man(after.total_assets(trigger))} · "
-                    f"距120万还差 {fmt_man(portfolio.target_jpy - after.total_assets(trigger))}"
+                    f"预计总资产 {fmt_jpy(after.total_assets(trigger))} · "
+                    f"距目标还差 {fmt_jpy(portfolio.target_jpy - after.total_assets(trigger))}"
                 ),
             )
         )
@@ -545,7 +545,7 @@ def build_recovery_plan(
                 result_desc=(
                     f"落袋现金 {fmt_jpy(after.cash_jpy)} · "
                     f"剩余 {after.xrp_quantity:,.0f} XRP · "
-                    f"总资产 {fmt_man(after.total_assets(trigger))}"
+                    f"总资产 {fmt_jpy(after.total_assets(trigger))}"
                 ),
             )
         )
@@ -586,7 +586,7 @@ def generate_trade_advice(
                 strength="请先",
                 title="设置回本目标",
                 reason="尚未配置原始投入目标",
-                detail="在侧边栏填写 TARGET_JPY（如 1200000）",
+                detail="在侧边栏填写回本目标金额（TARGET_JPY）",
             )
         )
         return advice
@@ -595,10 +595,10 @@ def generate_trade_advice(
         TradeAdvice(
             action="持有",
             strength="总览",
-            title=f"目标 {fmt_man(portfolio.target_jpy)} · 当前 {fmt_man(total)}",
-            reason=f"总盈亏 {fmt_jpy(portfolio.pnl(p))}（{portfolio.pnl_pct(p):+.1f}%）· 还差 {fmt_man(plan.recovery_gap)}",
+            title=f"目标 {fmt_jpy(portfolio.target_jpy)} · 当前 {fmt_jpy(total)}",
+            reason=f"总盈亏 {fmt_jpy(portfolio.pnl(p))}（{portfolio.pnl_pct(p):+.1f}%）· 还差 {fmt_jpy(plan.recovery_gap)}",
             detail=(
-                f"纯持有需 XRP 涨至约 {fmt_jpy(plan.hold_only_price)}/枚 才能回到120万；"
+                f"纯持有需 XRP 涨至约 {fmt_jpy(plan.hold_only_price)}/枚 才能达到投入目标；"
                 f"仅靠 {fmt_jpy(portfolio.cash_jpy)} 现金波段每次约赚 {fmt_jpy(plan.swing_cycle_profit)}，"
                 f"需配合价格上涨 + 低吸高抛。"
             ),
@@ -617,7 +617,7 @@ def generate_trade_advice(
                     detail=(
                         f"用 {fmt_jpy(dca_jpy)}（现金 1/3）买入约 {dca_jpy / p:.1f} XRP。"
                         f"买入后总持仓 {after.xrp_quantity:,.0f} 枚，"
-                        f"总资产 {fmt_man(after.total_assets(p))}。"
+                        f"总资产 {fmt_jpy(after.total_assets(p))}。"
                         f"等反弹至 MA20 {fmt_jpy(snapshot.ma20)} 再卖 15% 做波段。"
                     ),
                 )
@@ -685,7 +685,7 @@ def generate_trade_advice(
                 action="观望",
                 strength="当前",
                 title="等待触发 · 勿频繁操作",
-                reason=f"下一目标：{plan.next_milestone_label}（还差 {fmt_man(plan.next_milestone - total)}）",
+                reason=f"下一目标：{plan.next_milestone_label}（还差 {fmt_jpy(plan.next_milestone - total)}）",
                 detail=" · ".join(parts) if parts else "保持现有仓位，按 plan 表执行。",
             )
         )
@@ -705,7 +705,7 @@ def detect_signals(
     if snapshot.daily_rsi < DAILY_RSI_EXTREME and at_30d_low(snapshot):
         msg = (
             f"💡【极端超跌】可用 {fmt_jpy(dca_jpy)} 低吸，"
-            f"目标 {plan.next_milestone_label}（当前 {fmt_man(plan.total_assets)}）"
+            f"目标 {plan.next_milestone_label}（当前 {fmt_jpy(plan.total_assets)}）"
             if dca_jpy > 0
             else "💡【极端超跌】价格处于低位，但当前现金不足"
         )
@@ -718,19 +718,19 @@ def detect_signals(
                 card_body=(
                     f"{msg}\n\n"
                     f"**价格：** {fmt_jpy(p)} · RSI {snapshot.daily_rsi:.1f}\n"
-                    f"**总资产：** {fmt_man(plan.total_assets)} / 目标 {fmt_man(plan.target_jpy)}\n"
-                    f"**还差：** {fmt_man(plan.recovery_gap)}"
+                    f"**总资产：** {fmt_jpy(plan.total_assets)} / 目标 {fmt_jpy(plan.target_jpy)}\n"
+                    f"**还差：** {fmt_jpy(plan.recovery_gap)}"
                 ),
                 color=f"{Fore.GREEN}{Style.BRIGHT}",
             )
         )
 
     if plan.recovery_gap <= 0:
-        msg = f"🎉【回本】总资产已达 {fmt_man(plan.total_assets)}，超过 120 万目标！"
+        msg = f"🎉【回本】总资产已达 {fmt_jpy(plan.total_assets)}，超过投入目标！"
         signals.append(
             Signal(
                 key="target_reached",
-                title="120万目标达成",
+                title="投入目标达成",
                 console_msg=msg,
                 card_template="orange",
                 card_body=(
@@ -915,7 +915,7 @@ def print_dashboard(
     pnl = portfolio.pnl(p)
 
     print(f"{Fore.GREEN}{Style.BRIGHT}{'=' * 54}{Style.RESET_ALL}")
-    print(f"{Fore.GREEN}{Style.BRIGHT}  {PAIR_LABEL} 120万回本波段计划{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}{Style.BRIGHT}  {PAIR_LABEL} 回本波段计划{Style.RESET_ALL}")
     print(f"{Fore.GREEN}{Style.BRIGHT}{'=' * 54}{Style.RESET_ALL}")
     print(f"更新时间: {now}  |  数据源: {snapshot.data_source}")
     print(f"推送: {push_status}  |  RSI: {snapshot.daily_rsi:.1f}")
@@ -925,8 +925,8 @@ def print_dashboard(
     print("资产概况:")
     print(f"  XRP: {portfolio.xrp_quantity:,.0f} 枚 ({fmt_jpy(portfolio.xrp_value(p))})")
     print(f"  现金: {fmt_jpy(portfolio.cash_jpy)}")
-    print(f"  总资产: {Fore.WHITE}{Style.BRIGHT}{fmt_man(plan.total_assets)}{Style.RESET_ALL}")
-    print(f"  目标: {fmt_man(portfolio.target_jpy)}  |  还差: {fmt_man(plan.recovery_gap)}")
+    print(f"  总资产: {Fore.WHITE}{Style.BRIGHT}{fmt_jpy(plan.total_assets)}{Style.RESET_ALL}")
+    print(f"  目标: {fmt_jpy(portfolio.target_jpy)}  |  还差: {fmt_jpy(plan.recovery_gap)}")
     pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
     print(f"  总盈亏: {pnl_color}{fmt_jpy(pnl)} ({portfolio.pnl_pct(p):+.1f}%){Style.RESET_ALL}")
     print(f"  进度: {plan.recovery_pct * 100:.1f}% → 下一目标 {plan.next_milestone_label}")
@@ -962,7 +962,7 @@ def main() -> None:
     init(autoreset=True)
     cooldown = AlertCooldown(ALERT_COOLDOWN_SECONDS)
     portfolio = load_portfolio()
-    print(f"正在启动 {PAIR_LABEL} 120万回本波段监控...")
+    print(f"正在启动 {PAIR_LABEL} 回本波段监控...")
 
     while True:
         try:
