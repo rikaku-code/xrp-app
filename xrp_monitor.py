@@ -20,8 +20,13 @@ from colorama import Fore, Style, init
 
 # ── 交易与轮询 ──────────────────────────────────────────────
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BITBANK_TICKER_URL = "https://public.bitbank.cc/xrp_jpy/ticker"
+BITBANK_CANDLE_URL = "https://public.bitbank.cc/xrp_jpy/candlestick/1day/{year}"
+COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
+COINGECKO_CHART_URL = "https://api.coingecko.com/api/v3/coins/ripple/market_chart"
 SYMBOL = "XRPJPY"
 PAIR_LABEL = "XRP/JPY"
+REQUEST_HEADERS = {"User-Agent": "xrp-monitor/1.0"}
 REFRESH_SECONDS = 60
 ALERT_COOLDOWN_SECONDS = 24 * 60 * 60
 QUIET_HOUR_START = 0
@@ -159,7 +164,9 @@ def clear_screen() -> None:
 
 def fetch_binance_klines(interval: str, limit: int) -> pd.DataFrame:
     params = {"symbol": SYMBOL, "interval": interval, "limit": limit}
-    response = requests.get(BINANCE_KLINES_URL, params=params, timeout=15)
+    response = requests.get(
+        BINANCE_KLINES_URL, params=params, timeout=15, headers=REQUEST_HEADERS
+    )
     response.raise_for_status()
     raw = response.json()
     df = pd.DataFrame(
@@ -175,23 +182,114 @@ def fetch_binance_klines(interval: str, limit: int) -> pd.DataFrame:
     return df
 
 
-def build_snapshot() -> MarketSnapshot:
-    intraday = fetch_binance_klines("15m", 5)
-    daily = fetch_binance_klines("1d", max(LOW_LOOKBACK_DAYS + DAILY_RSI_PERIOD, 60))
+def fetch_bitbank_ticker() -> float:
+    response = requests.get(BITBANK_TICKER_URL, timeout=15, headers=REQUEST_HEADERS)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("success") != 1:
+        raise requests.RequestException("Bitbank ticker 返回失败")
+    return float(payload["data"]["last"])
 
-    price = float(intraday["close"].iloc[-1])
+
+def fetch_bitbank_daily() -> pd.DataFrame:
+    current_year = now_local().year
+    years = {current_year - 1, current_year}
+    frames: list[pd.DataFrame] = []
+
+    for year in sorted(years):
+        url = BITBANK_CANDLE_URL.format(year=year)
+        response = requests.get(url, timeout=15, headers=REQUEST_HEADERS)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("success") != 1:
+            continue
+        candles = payload["data"]["candlestick"][0]["ohlcv"]
+        df = pd.DataFrame(
+            candles, columns=["open", "high", "low", "close", "volume", "timestamp"]
+        )
+        for col in ("open", "high", "low", "close", "volume"):
+            df[col] = df[col].astype(float)
+        frames.append(df)
+
+    if not frames:
+        raise requests.RequestException("Bitbank 日线数据为空")
+
+    daily = pd.concat(frames, ignore_index=True)
+    daily = daily.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    return daily.reset_index(drop=True)
+
+
+def fetch_coingecko_daily(days: int = 90) -> tuple[float, pd.DataFrame]:
+    price_resp = requests.get(
+        COINGECKO_PRICE_URL,
+        params={"ids": "ripple", "vs_currencies": "jpy"},
+        timeout=15,
+        headers=REQUEST_HEADERS,
+    )
+    price_resp.raise_for_status()
+    price = float(price_resp.json()["ripple"]["jpy"])
+
+    chart_resp = requests.get(
+        COINGECKO_CHART_URL,
+        params={"vs_currency": "jpy", "days": days, "interval": "daily"},
+        timeout=15,
+        headers=REQUEST_HEADERS,
+    )
+    chart_resp.raise_for_status()
+    chart = chart_resp.json()
+    prices = chart.get("prices", [])
+    if len(prices) < DAILY_RSI_PERIOD + 5:
+        raise requests.RequestException("CoinGecko 历史数据不足")
+
+    df = pd.DataFrame(prices, columns=["timestamp", "close"])
+    df["open"] = df["close"]
+    df["high"] = df["close"]
+    df["low"] = df["close"]
+    df["volume"] = 0.0
+    return price, df
+
+
+def _snapshot_from_daily(price: float, daily: pd.DataFrame, source: str) -> MarketSnapshot:
     rsi_series = ta.momentum.RSIIndicator(
         close=daily["close"], window=DAILY_RSI_PERIOD
     ).rsi()
     daily_rsi = float(rsi_series.iloc[-1])
     low_30d = float(daily["low"].tail(LOW_LOOKBACK_DAYS).min())
-
     return MarketSnapshot(
         price=price,
         daily_rsi=daily_rsi,
         low_30d=low_30d,
-        data_source="Binance",
+        data_source=source,
     )
+
+
+def build_snapshot() -> MarketSnapshot:
+    errors: list[str] = []
+
+    try:
+        price = fetch_bitbank_ticker()
+        daily = fetch_bitbank_daily()
+        return _snapshot_from_daily(price, daily, "Bitbank")
+    except requests.RequestException as exc:
+        errors.append(f"Bitbank: {exc}")
+
+    try:
+        price, daily = fetch_coingecko_daily(
+            days=max(LOW_LOOKBACK_DAYS + DAILY_RSI_PERIOD + 5, 90)
+        )
+        return _snapshot_from_daily(price, daily, "CoinGecko")
+    except requests.RequestException as exc:
+        errors.append(f"CoinGecko: {exc}")
+
+    try:
+        intraday = fetch_binance_klines("15m", 5)
+        daily = fetch_binance_klines("1d", max(LOW_LOOKBACK_DAYS + DAILY_RSI_PERIOD, 60))
+        price = float(intraday["close"].iloc[-1])
+        return _snapshot_from_daily(price, daily, "Binance")
+    except requests.RequestException as exc:
+        errors.append(f"Binance: {exc}")
+
+    raise requests.RequestException(" / ".join(errors))
 
 
 def at_30d_low(snapshot: MarketSnapshot) -> bool:
