@@ -1,0 +1,18 @@
+[Unit]
+Description=XRP/JPY Monitor with Lark Push
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xrpmon
+Group=xrpmon
+WorkingDirectory=/opt/xrp_monitor
+Environment=APP_TIMEZONE=Asia/Tokyo
+EnvironmentFile=-/opt/xrp_monitor/.env
+ExecStart=/opt/xrp_monitor/venv/bin/python /opt/xrp_monitor/xrp_monitor.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
