@@ -1,4 +1,4 @@
-"""XRP/JPY Streamlit 监控面板 — 自动刷新 + Lark 买卖信号推送。"""
+"""XRP/JPY Streamlit 监控面板 — 持仓回本分析与买卖建议。"""
 
 from __future__ import annotations
 
@@ -12,18 +12,34 @@ import xrp_monitor as monitor
 def apply_streamlit_secrets() -> None:
     """Streamlit Cloud 从 Secrets 注入环境变量。"""
     try:
-        for key in ("FEISHU_WEBHOOK_URL", "FEISHU_SECRET", "APP_TIMEZONE"):
+        import os
+
+        for key in (
+            "FEISHU_WEBHOOK_URL",
+            "FEISHU_SECRET",
+            "APP_TIMEZONE",
+            "HOLDINGS_XRP",
+            "HOLDINGS_COST_JPY",
+        ):
             if key in st.secrets:
-                import os
                 os.environ[key] = str(st.secrets[key])
         monitor.reload_config()
     except (FileNotFoundError, AttributeError, RuntimeError):
         pass
 
+
+ADVICE_STYLE = {
+    "买入": "success",
+    "卖出": "warning",
+    "持有": "info",
+    "观望": "secondary",
+    "配置": "error",
+}
+
 SIGNAL_STYLE = {
-    "extreme_oversold": ("success", "💡 极端超跌买点"),
-    "rebound_190": ("info", "📈 反弹阶梯 ¥190"),
-    "breakeven_210": ("warning", "🎉 回本提醒 ¥210"),
+    "extreme_oversold": ("success", "💡 极端超跌 · 加仓"),
+    "breakeven_reached": ("warning", "🎉 回本提醒"),
+    "recovery_progress": ("info", "📈 反弹进展"),
 }
 
 
@@ -32,6 +48,21 @@ def init_session_state() -> None:
         st.session_state.alert_log = []
     if "toast_keys" not in st.session_state:
         st.session_state.toast_keys = set()
+    if "holdings_xrp" not in st.session_state:
+        st.session_state.holdings_xrp = float(
+            monitor.load_position().quantity
+        )
+    if "holdings_cost" not in st.session_state:
+        st.session_state.holdings_cost = float(
+            monitor.load_position().total_cost_jpy
+        )
+
+
+def get_position() -> monitor.Position:
+    return monitor.Position(
+        quantity=st.session_state.holdings_xrp,
+        total_cost_jpy=st.session_state.holdings_cost,
+    )
 
 
 def append_alert_log(message: str, level: str = "info") -> None:
@@ -46,103 +77,100 @@ def append_alert_log(message: str, level: str = "info") -> None:
     st.session_state.alert_log = st.session_state.alert_log[:30]
 
 
-def render_technical_indicators(snapshot: monitor.MarketSnapshot) -> None:
-    st.subheader("技术指标")
-    row1 = st.columns(4)
-    row1[0].metric(
-        f"RSI({monitor.DAILY_RSI_PERIOD})",
-        f"{snapshot.daily_rsi:.1f}",
-        monitor.rsi_zone(snapshot.daily_rsi),
-    )
-    row1[1].metric("MA20", f"¥{snapshot.ma20:,.2f}")
-    row1[2].metric("MA50", f"¥{snapshot.ma50:,.2f}")
-    row1[3].metric("均线趋势", monitor.ma_trend(snapshot.price, snapshot.ma20, snapshot.ma50))
-
-    row2 = st.columns(4)
-    row2[0].metric("MACD", f"{snapshot.macd:+.3f}")
-    row2[1].metric("MACD 信号", f"{snapshot.macd_signal:+.3f}")
-    row2[2].metric("MACD 柱", f"{snapshot.macd_hist:+.3f}", monitor.macd_trend(snapshot.macd_hist))
-    row2[3].metric(
-        "布林带",
-        monitor.bb_position(snapshot.price, snapshot.bb_upper, snapshot.bb_lower),
-        delta=f"¥{snapshot.bb_lower:,.0f}–¥{snapshot.bb_upper:,.0f}",
+def render_position(position: monitor.Position, snapshot: monitor.MarketSnapshot) -> None:
+    st.subheader("我的持仓")
+    pnl = position.unrealized_pnl(snapshot.price)
+    cols = st.columns(4)
+    cols[0].metric("持仓数量", f"{position.quantity:,.1f} XRP")
+    cols[1].metric("总成本", monitor.fmt_jpy(position.total_cost_jpy))
+    cols[2].metric("持仓均价", monitor.fmt_jpy(position.avg_cost))
+    cols[3].metric(
+        "浮盈浮亏",
+        monitor.fmt_jpy(pnl),
+        f"{position.pnl_pct(snapshot.price):+.1f}%",
+        delta_color="normal" if pnl >= 0 else "inverse",
     )
 
-    row3 = st.columns(3)
-    row3[0].metric("30日最低", f"¥{snapshot.low_30d:,.2f}")
-    row3[1].metric("30日最高", f"¥{snapshot.high_30d:,.2f}")
-    dist_cost = snapshot.price - monitor.MY_COST_PRICE
-    row3[2].metric(
-        "距成本价",
-        f"{'+' if dist_cost >= 0 else ''}{dist_cost:,.2f} JPY",
-        delta=f"成本 ¥{monitor.MY_COST_PRICE}",
-        delta_color="normal" if dist_cost >= 0 else "inverse",
+
+def render_recovery_plan(
+    plan: monitor.RecoveryPlan,
+    position: monitor.Position,
+    snapshot: monitor.MarketSnapshot,
+) -> None:
+    st.subheader("回本分析")
+    cols = st.columns(3)
+    cols[0].metric(
+        "回本目标价",
+        monitor.fmt_jpy(plan.breakeven_price),
+        f"还差 {monitor.fmt_jpy(abs(plan.distance_jpy))}" if plan.distance_jpy < 0 else "已回本",
+        delta_color="inverse" if plan.distance_jpy < 0 else "normal",
     )
+    cols[1].metric(
+        f"补仓 {monitor.fmt_jpy(plan.dca_buy_jpy)} 后均价",
+        monitor.fmt_jpy(plan.dca_breakeven_after),
+        f"降 {monitor.fmt_jpy(plan.breakeven_price - plan.dca_breakeven_after)}",
+    )
+    cols[2].metric(
+        "回收本金需卖",
+        f"{plan.recover_principal_qty:,.1f} XRP",
+        f"@{monitor.fmt_jpy(snapshot.price)}",
+    )
+
+    if plan.breakeven_price > 0:
+        floor = snapshot.low_30d
+        span = plan.breakeven_price - floor
+        progress = 1.0 if span <= 0 else (snapshot.price - floor) / span
+        progress = max(0.0, min(1.0, progress))
+        st.progress(
+            progress,
+            text=(
+                f"当前 {monitor.fmt_jpy(snapshot.price)} → "
+                f"回本 {monitor.fmt_jpy(plan.breakeven_price)}"
+            ),
+        )
+
+    st.caption(
+        f"保守卖出参考 {monitor.fmt_jpy(plan.sell_target_conservative)} · "
+        f"积极卖出参考 {monitor.fmt_jpy(plan.sell_target_aggressive)} · "
+        f"30日区间 {monitor.fmt_jpy(snapshot.low_30d)}–{monitor.fmt_jpy(snapshot.high_30d)}"
+    )
+
+
+def render_trade_advice(advice: list[monitor.TradeAdvice]) -> None:
+    st.subheader("买卖建议")
+    for item in advice:
+        style = ADVICE_STYLE.get(item.action, "info")
+        label = f"**[{item.action}]** {item.strength} · {item.title}"
+        body = f"{item.reason}\n\n{item.detail}"
+        if style == "success":
+            st.success(f"{label}\n\n{body}")
+        elif style == "warning":
+            st.warning(f"{label}\n\n{body}")
+        elif style == "error":
+            st.error(f"{label}\n\n{body}")
+        else:
+            st.info(f"{label}\n\n{body}")
 
 
 def render_price_chart(chart_data) -> None:
     if chart_data is None or chart_data.empty:
         return
-    st.subheader("价格与均线（近 60 日）")
-    st.line_chart(chart_data, height=280)
-
-
-def render_signal_conditions(snapshot: monitor.MarketSnapshot) -> None:
-    st.subheader("触发条件检查")
-    cols = st.columns(3)
-
-    extreme_ok = (
-        snapshot.daily_rsi < monitor.DAILY_RSI_EXTREME
-        and monitor.at_30d_low(snapshot)
-    )
-    cols[0].metric(
-        "极端超跌",
-        "已满足" if extreme_ok else "未满足",
-        delta=f"RSI {snapshot.daily_rsi:.1f} / 需 < {monitor.DAILY_RSI_EXTREME}",
-        delta_color="normal" if extreme_ok else "off",
-    )
-
-    rebound_ok = snapshot.price >= monitor.REBOUND_PRICE
-    cols[1].metric(
-        "反弹 ¥190",
-        "已满足" if rebound_ok else "未满足",
-        delta=f"还差 ¥{max(0, monitor.REBOUND_PRICE - snapshot.price):.2f}",
-        delta_color="normal" if rebound_ok else "off",
-    )
-
-    breakeven_ok = snapshot.price >= monitor.MY_COST_PRICE
-    cols[2].metric(
-        "回本 ¥210",
-        "已满足" if breakeven_ok else "未满足",
-        delta=f"还差 ¥{max(0, monitor.MY_COST_PRICE - snapshot.price):.2f}",
-        delta_color="normal" if breakeven_ok else "off",
-    )
-
-
-def render_price_progress(snapshot: monitor.MarketSnapshot) -> None:
-    st.subheader("解套进度")
-    floor_price = snapshot.low_30d
-    span = monitor.MY_COST_PRICE - floor_price
-    progress = 1.0 if span <= 0 else (snapshot.price - floor_price) / span
-    progress = max(0.0, min(1.0, progress))
-    st.progress(
-        progress,
-        text=f"当前 ¥{snapshot.price:,.2f} → 目标成本 ¥{monitor.MY_COST_PRICE}",
-    )
+    st.subheader("价格走势")
+    st.line_chart(chart_data, height=260)
+    if "breakeven" in chart_data.columns:
+        st.caption("虚线区域为持仓均价（回本价）")
 
 
 def render_signals(
     signals: list[monitor.Signal], cooldown: monitor.AlertCooldown
 ) -> None:
-    st.subheader("买卖信号")
     if not signals:
-        st.info("当前暂无触发信号，程序持续监控中。")
         return
-
+    st.subheader("Lark 推送信号")
     for signal in signals:
         style, _ = SIGNAL_STYLE.get(signal.key, ("info", signal.title))
         remain = cooldown.remaining_hours(signal.key)
-        suffix = f"（Lark 冷却中，剩余 {remain:.1f} 小时）" if remain > 0 else ""
+        suffix = f"（冷却中 {remain:.1f}h）" if remain > 0 else ""
         message = f"{signal.console_msg}{suffix}"
         if style == "success":
             st.success(message)
@@ -171,35 +199,39 @@ def handle_push_results(push_results: list[dict]) -> None:
             st.session_state.toast_keys.discard(key)
         elif status == "quiet_hours":
             append_alert_log(
-                f"静默时段（{monitor.quiet_hours_label()}），暂不推送 Lark",
+                f"静默时段（{monitor.quiet_hours_label()}），暂不推送",
                 "info",
             )
 
 
 def render_monitor_panel(refresh_seconds: int) -> None:
-    st.title("XRP/JPY 长期持仓监控")
+    st.title("XRP/JPY 持仓回本监控")
+
+    position = get_position()
 
     try:
         cooldown = monitor.AlertCooldown(monitor.ALERT_COOLDOWN_SECONDS)
-        result = monitor.run_monitor_cycle(cooldown)
+        result = monitor.run_monitor_cycle(cooldown, position)
     except Exception as exc:
         st.error(f"数据获取失败：{exc}")
         return
 
     snapshot: monitor.MarketSnapshot = result["snapshot"]
+    plan: monitor.RecoveryPlan = result["recovery_plan"]
+    advice: list[monitor.TradeAdvice] = result["advice"]
     signals: list[monitor.Signal] = result["signals"]
     push_results = result["push_results"]
     chart_data = result.get("chart_data")
     updated_at: datetime = result["updated_at"]
 
     st.caption(
-        f"数据源: {snapshot.data_source} · 飞书 Lark 推送 · "
-        f"自动刷新 {refresh_seconds} 秒 · "
-        f"每信号 {monitor.ALERT_COOLDOWN_SECONDS // 3600} 小时冷却 · "
+        f"数据源: {snapshot.data_source} · RSI {snapshot.daily_rsi:.1f} · "
+        f"自动刷新 {refresh_seconds}s · "
+        f"推送冷却 {monitor.ALERT_COOLDOWN_SECONDS // 3600}h · "
         f"静默 {monitor.quiet_hours_label()}"
     )
     if monitor.is_quiet_hours():
-        st.info(f"🌙 当前为静默时段（{monitor.quiet_hours_label()}），Lark 暂不推送。")
+        st.info(f"🌙 静默时段（{monitor.quiet_hours_label()}），Lark 暂不推送。")
 
     handle_push_results(push_results)
 
@@ -209,20 +241,14 @@ def render_monitor_panel(refresh_seconds: int) -> None:
             st.toast(signal.console_msg, icon="🔔")
             st.session_state.toast_keys.add(toast_key)
 
-    top = st.columns(4)
-    top[0].metric("当前价格", f"¥{snapshot.price:,.2f}")
-    top[1].metric(
-        "日线 RSI",
-        f"{snapshot.daily_rsi:.2f}",
-        monitor.rsi_zone(snapshot.daily_rsi),
-    )
-    top[2].metric("30日区间", f"¥{snapshot.low_30d:,.0f}–¥{snapshot.high_30d:,.0f}")
-    top[3].metric("更新时间", updated_at.strftime("%H:%M:%S"))
+    top = st.columns(2)
+    top[0].metric("当前价格", monitor.fmt_jpy(snapshot.price))
+    top[1].metric("更新时间", updated_at.strftime("%H:%M:%S"))
 
-    render_technical_indicators(snapshot)
+    render_position(position, snapshot)
+    render_recovery_plan(plan, position, snapshot)
+    render_trade_advice(advice)
     render_price_chart(chart_data)
-    render_price_progress(snapshot)
-    render_signal_conditions(snapshot)
     render_signals(signals, cooldown)
 
     with st.expander("推送记录", expanded=False):
@@ -240,7 +266,7 @@ def render_monitor_panel(refresh_seconds: int) -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="XRP/JPY 监控",
+        page_title="XRP/JPY 持仓监控",
         page_icon="📊",
         layout="wide",
     )
@@ -248,29 +274,38 @@ def main() -> None:
     init_session_state()
 
     with st.sidebar:
+        st.header("我的持仓")
+        st.session_state.holdings_xrp = st.number_input(
+            "XRP 数量",
+            min_value=0.0,
+            value=st.session_state.holdings_xrp,
+            step=100.0,
+            format="%.1f",
+        )
+        st.session_state.holdings_cost = st.number_input(
+            "总投入成本（日元）",
+            min_value=0.0,
+            value=st.session_state.holdings_cost,
+            step=1000.0,
+            format="%.0f",
+        )
+        pos = get_position()
+        if pos.quantity > 0:
+            st.caption(f"持仓均价：{monitor.fmt_jpy(pos.avg_cost)}")
+
+        st.divider()
         st.header("设置")
         refresh_seconds = st.slider("自动刷新间隔（秒）", 30, 300, 60, step=30)
         lark_status = "已配置 ✅" if monitor.FEISHU_WEBHOOK_URL else "未配置 ❌"
         st.write(f"飞书 Lark：{lark_status}")
-        st.write(f"成本价：¥{monitor.MY_COST_PRICE}")
-        st.write(f"反弹阶梯：¥{monitor.REBOUND_PRICE}")
         st.write(f"推送冷却：{monitor.ALERT_COOLDOWN_SECONDS // 3600} 小时/信号")
-        st.write(f"静默时段：{monitor.quiet_hours_label()}（不推 Lark）")
+        st.write(f"静默时段：{monitor.quiet_hours_label()}")
         st.write(
-            f"当前状态：{'🌙 静默中' if monitor.is_quiet_hours() else '🔔 推送中'}"
+            f"当前：{'🌙 静默中' if monitor.is_quiet_hours() else '🔔 推送中'}"
         )
         if st.button("立即刷新", use_container_width=True):
             st.session_state.toast_keys.clear()
             st.rerun()
-        st.divider()
-        st.markdown(
-            "**启动命令**\n\n"
-            "```bash\n"
-            "cd xrp_monitor\n"
-            "pip install -r requirements.txt\n"
-            "streamlit run streamlit_app.py\n"
-            "```"
-        )
 
     @st.fragment(run_every=timedelta(seconds=refresh_seconds))
     def monitor_loop() -> None:
