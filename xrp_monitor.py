@@ -33,9 +33,9 @@ QUIET_HOUR_START = 0
 QUIET_HOUR_END = 8
 
 # ── 持仓（通过 .env 或 Streamlit Secrets 配置）──────────────
-DEFAULT_HOLDINGS_XRP = 1000.0
-DEFAULT_HOLDINGS_AVG_COST = 210.0
-DEFAULT_AVAILABLE_JPY = 90_000.0
+DEFAULT_HOLDINGS_XRP = 1258.0
+DEFAULT_HOLDINGS_AVG_COST = 1_200_000 / 5_800  # 原 5800 枚 · 总成本 120 万日元
+DEFAULT_AVAILABLE_JPY = 11_000.0
 DCA_FRACTION = 1 / 3
 
 # ── 信号阈值 ────────────────────────────────────────────────
