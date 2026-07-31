@@ -19,7 +19,8 @@ def apply_streamlit_secrets() -> None:
             "FEISHU_SECRET",
             "APP_TIMEZONE",
             "HOLDINGS_XRP",
-            "HOLDINGS_COST_JPY",
+            "HOLDINGS_AVG_COST",
+            "AVAILABLE_JPY",
         ):
             if key in st.secrets:
                 os.environ[key] = str(st.secrets[key])
@@ -52,16 +53,18 @@ def init_session_state() -> None:
         st.session_state.holdings_xrp = float(
             monitor.load_position().quantity
         )
-    if "holdings_cost" not in st.session_state:
-        st.session_state.holdings_cost = float(
-            monitor.load_position().total_cost_jpy
+    if "holdings_avg_cost" not in st.session_state:
+        st.session_state.holdings_avg_cost = float(
+            monitor.load_position().avg_cost_jpy
         )
+    if "available_jpy" not in st.session_state:
+        st.session_state.available_jpy = float(monitor.load_available_jpy())
 
 
 def get_position() -> monitor.Position:
     return monitor.Position(
         quantity=st.session_state.holdings_xrp,
-        total_cost_jpy=st.session_state.holdings_cost,
+        avg_cost_jpy=st.session_state.holdings_avg_cost,
     )
 
 
@@ -77,13 +80,22 @@ def append_alert_log(message: str, level: str = "info") -> None:
     st.session_state.alert_log = st.session_state.alert_log[:30]
 
 
-def render_position(position: monitor.Position, snapshot: monitor.MarketSnapshot) -> None:
+def render_position(
+    position: monitor.Position,
+    snapshot: monitor.MarketSnapshot,
+    available_jpy: float,
+    plan: monitor.RecoveryPlan,
+) -> None:
     st.subheader("我的持仓")
     pnl = position.unrealized_pnl(snapshot.price)
     cols = st.columns(4)
     cols[0].metric("持仓数量", f"{position.quantity:,.1f} XRP")
-    cols[1].metric("总成本", monitor.fmt_jpy(position.total_cost_jpy))
-    cols[2].metric("持仓均价", monitor.fmt_jpy(position.avg_cost))
+    cols[1].metric("持仓均价", monitor.fmt_jpy(position.avg_cost_jpy))
+    cols[2].metric(
+        "日元可支配资产",
+        monitor.fmt_jpy(available_jpy),
+        f"建议单次加仓 {monitor.fmt_jpy(plan.dca_buy_jpy)}",
+    )
     cols[3].metric(
         "浮盈浮亏",
         monitor.fmt_jpy(pnl),
@@ -208,10 +220,11 @@ def render_monitor_panel(refresh_seconds: int) -> None:
     st.title("XRP/JPY 持仓回本监控")
 
     position = get_position()
+    available_jpy = st.session_state.available_jpy
 
     try:
         cooldown = monitor.AlertCooldown(monitor.ALERT_COOLDOWN_SECONDS)
-        result = monitor.run_monitor_cycle(cooldown, position)
+        result = monitor.run_monitor_cycle(cooldown, position, available_jpy)
     except Exception as exc:
         st.error(f"数据获取失败：{exc}")
         return
@@ -245,7 +258,7 @@ def render_monitor_panel(refresh_seconds: int) -> None:
     top[0].metric("当前价格", monitor.fmt_jpy(snapshot.price))
     top[1].metric("更新时间", updated_at.strftime("%H:%M:%S"))
 
-    render_position(position, snapshot)
+    render_position(position, snapshot, available_jpy, plan)
     render_recovery_plan(plan, position, snapshot)
     render_trade_advice(advice)
     render_price_chart(chart_data)
@@ -282,16 +295,28 @@ def main() -> None:
             step=100.0,
             format="%.1f",
         )
-        st.session_state.holdings_cost = st.number_input(
-            "总投入成本（日元）",
+        st.session_state.holdings_avg_cost = st.number_input(
+            "持仓均价（日元）",
             min_value=0.0,
-            value=st.session_state.holdings_cost,
+            value=st.session_state.holdings_avg_cost,
+            step=1.0,
+            format="%.2f",
+            help="用于计算回本价，可在交易所查看平均买入价",
+        )
+        st.session_state.available_jpy = st.number_input(
+            "日元可支配资产",
+            min_value=0.0,
+            value=st.session_state.available_jpy,
             step=1000.0,
             format="%.0f",
+            help="可用于买入 XRP 的日元，建议单次加仓约 1/3",
         )
         pos = get_position()
-        if pos.quantity > 0:
-            st.caption(f"持仓均价：{monitor.fmt_jpy(pos.avg_cost)}")
+        if pos.quantity > 0 and pos.avg_cost_jpy > 0:
+            st.caption(
+                f"投入成本 {monitor.fmt_jpy(pos.total_cost_jpy)} · "
+                f"单次建议加仓 {monitor.fmt_jpy(monitor.suggest_dca_jpy(st.session_state.available_jpy))}"
+            )
 
         st.divider()
         st.header("设置")

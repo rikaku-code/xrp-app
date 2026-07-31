@@ -34,8 +34,9 @@ QUIET_HOUR_END = 8
 
 # ── 持仓（通过 .env 或 Streamlit Secrets 配置）──────────────
 DEFAULT_HOLDINGS_XRP = 1000.0
-DEFAULT_HOLDINGS_COST_JPY = 210_000.0
-DCA_SUGGEST_JPY = 30_000.0
+DEFAULT_HOLDINGS_AVG_COST = 210.0
+DEFAULT_AVAILABLE_JPY = 90_000.0
+DCA_FRACTION = 1 / 3
 
 # ── 信号阈值 ────────────────────────────────────────────────
 DAILY_RSI_PERIOD = 14
@@ -59,16 +60,18 @@ FEISHU_SECRET = os.getenv("FEISHU_SECRET", "")
 
 @dataclass(frozen=True)
 class Position:
-    """持仓：数量 + 总投入成本（日元）。"""
+    """持仓：数量 + 持仓均价（日元/XRP）。"""
 
     quantity: float
-    total_cost_jpy: float
+    avg_cost_jpy: float
 
     @property
     def avg_cost(self) -> float:
-        if self.quantity <= 0:
-            return 0.0
-        return self.total_cost_jpy / self.quantity
+        return self.avg_cost_jpy
+
+    @property
+    def total_cost_jpy(self) -> float:
+        return self.quantity * self.avg_cost_jpy
 
     def market_value(self, price: float) -> float:
         return self.quantity * price
@@ -85,10 +88,9 @@ class Position:
         if buy_price <= 0 or buy_jpy <= 0:
             return self
         added_qty = buy_jpy / buy_price
-        return Position(
-            quantity=self.quantity + added_qty,
-            total_cost_jpy=self.total_cost_jpy + buy_jpy,
-        )
+        new_qty = self.quantity + added_qty
+        new_avg = (self.total_cost_jpy + buy_jpy) / new_qty
+        return Position(quantity=new_qty, avg_cost_jpy=new_avg)
 
 
 @dataclass(frozen=True)
@@ -166,15 +168,28 @@ reload_config()
 
 def load_position(
     quantity: float | None = None,
-    total_cost_jpy: float | None = None,
+    avg_cost_jpy: float | None = None,
 ) -> Position:
     qty = quantity if quantity is not None else float(
         os.getenv("HOLDINGS_XRP", DEFAULT_HOLDINGS_XRP)
     )
-    cost = total_cost_jpy if total_cost_jpy is not None else float(
-        os.getenv("HOLDINGS_COST_JPY", DEFAULT_HOLDINGS_COST_JPY)
+    avg = avg_cost_jpy if avg_cost_jpy is not None else float(
+        os.getenv("HOLDINGS_AVG_COST", DEFAULT_HOLDINGS_AVG_COST)
     )
-    return Position(quantity=max(0.0, qty), total_cost_jpy=max(0.0, cost))
+    return Position(quantity=max(0.0, qty), avg_cost_jpy=max(0.0, avg))
+
+
+def load_available_jpy(available_jpy: float | None = None) -> float:
+    if available_jpy is not None:
+        return max(0.0, available_jpy)
+    return max(0.0, float(os.getenv("AVAILABLE_JPY", DEFAULT_AVAILABLE_JPY)))
+
+
+def suggest_dca_jpy(available_jpy: float) -> float:
+    """单次加仓建议：可支配资金的 1/3。"""
+    if available_jpy <= 0:
+        return 0.0
+    return available_jpy * DCA_FRACTION
 
 
 COOLDOWN_FILE = os.path.join(
@@ -430,15 +445,20 @@ def at_30d_low(snapshot: MarketSnapshot) -> bool:
     return snapshot.price <= threshold
 
 
-def build_recovery_plan(snapshot: MarketSnapshot, position: Position) -> RecoveryPlan:
+def build_recovery_plan(
+    snapshot: MarketSnapshot,
+    position: Position,
+    available_jpy: float,
+) -> RecoveryPlan:
     be = position.avg_cost
     dist = snapshot.price - be
     dist_pct = (dist / be * 100) if be > 0 else 0.0
+    dca_jpy = suggest_dca_jpy(available_jpy)
 
     recover_qty = (
         position.total_cost_jpy / snapshot.price if snapshot.price > 0 else 0.0
     )
-    after_dca = position.dca_preview(DCA_SUGGEST_JPY, snapshot.price)
+    after_dca = position.dca_preview(dca_jpy, snapshot.price)
 
     loss = max(0.0, -position.unrealized_pnl(snapshot.price))
     milestone_50 = snapshot.price + (loss * 0.5 / position.quantity if position.quantity > 0 else 0)
@@ -450,7 +470,7 @@ def build_recovery_plan(snapshot: MarketSnapshot, position: Position) -> Recover
         distance_pct=dist_pct,
         recover_principal_qty=min(recover_qty, position.quantity),
         dca_breakeven_after=after_dca.avg_cost,
-        dca_buy_jpy=DCA_SUGGEST_JPY,
+        dca_buy_jpy=dca_jpy,
         milestone_50pct=milestone_50,
         milestone_80pct=milestone_80,
         sell_target_conservative=max(be, snapshot.ma20),
@@ -468,47 +488,62 @@ def generate_trade_advice(
     be = plan.breakeven_price
     rsi = snapshot.daily_rsi
 
-    if position.quantity <= 0 or position.total_cost_jpy <= 0:
+    dca_jpy = plan.dca_buy_jpy
+
+    if position.quantity <= 0 or position.avg_cost_jpy <= 0:
         advice.append(
             TradeAdvice(
                 action="配置",
                 strength="请先",
                 title="设置持仓",
-                reason="尚未配置 XRP 数量与总成本",
-                detail="在侧边栏或 .env 填写 HOLDINGS_XRP 和 HOLDINGS_COST_JPY",
+                reason="尚未配置 XRP 数量与持仓均价",
+                detail="在侧边栏或 .env 填写 HOLDINGS_XRP 和 HOLDINGS_AVG_COST",
             )
         )
         return advice
 
     if rsi < DAILY_RSI_EXTREME and at_30d_low(snapshot):
-        after = position.dca_preview(DCA_SUGGEST_JPY, p)
-        advice.append(
-            TradeAdvice(
-                action="买入",
-                strength="强烈建议",
-                title="极端超跌 · 分批加仓",
-                reason=f"RSI {rsi:.1f} 且价格贴近 30 日低点",
-                detail=(
-                    f"可用约 {fmt_jpy(DCA_SUGGEST_JPY)} 挂限价单低吸。"
-                    f"若成交，持仓均价将从 {fmt_jpy(be)} 降至约 {fmt_jpy(after.avg_cost)}，"
-                    f"更快接近回本。"
-                ),
+        if dca_jpy > 0:
+            after = position.dca_preview(dca_jpy, p)
+            advice.append(
+                TradeAdvice(
+                    action="买入",
+                    strength="强烈建议",
+                    title="极端超跌 · 分批加仓",
+                    reason=f"RSI {rsi:.1f} 且价格贴近 30 日低点",
+                    detail=(
+                        f"可用约 {fmt_jpy(dca_jpy)}（可支配资金的 1/3）挂限价单低吸。"
+                        f"若成交，持仓均价将从 {fmt_jpy(be)} 降至约 {fmt_jpy(after.avg_cost)}，"
+                        f"更快接近回本。"
+                    ),
+                )
             )
-        )
+        else:
+            advice.append(
+                TradeAdvice(
+                    action="买入",
+                    strength="强烈建议",
+                    title="极端超跌 · 分批加仓",
+                    reason=f"RSI {rsi:.1f} 且价格贴近 30 日低点",
+                    detail="当前可支配资金为 0，请补充日元后再考虑加仓。",
+                )
+            )
     elif rsi < RSI_OVERSOLD and p <= snapshot.bb_lower * 1.02:
-        after = position.dca_preview(DCA_SUGGEST_JPY, p)
-        advice.append(
-            TradeAdvice(
-                action="买入",
-                strength="可考虑",
-                title="超卖区 · 小仓补仓",
-                reason=f"RSI {rsi:.1f}，价格接近布林带下轨",
-                detail=(
-                    f"非极端低位，建议只用部分闲置资金（如 {fmt_jpy(DCA_SUGGEST_JPY / 2):,.0f}）。"
-                    f"补仓后均价约 {fmt_jpy(after.avg_cost)}。"
-                ),
+        small_buy = dca_jpy / 2 if dca_jpy > 0 else 0.0
+        if small_buy > 0:
+            after = position.dca_preview(small_buy, p)
+            advice.append(
+                TradeAdvice(
+                    action="买入",
+                    strength="可考虑",
+                    title="超卖区 · 小仓补仓",
+                    reason=f"RSI {rsi:.1f}，价格接近布林带下轨",
+                    detail=(
+                        f"非极端低位，建议只用约 {fmt_jpy(small_buy)}。"
+                        f"补仓后均价约 {fmt_jpy(after.avg_cost)}。"
+                    ),
+                )
             )
-        )
 
     if p >= be and position.unrealized_pnl(p) >= 0:
         sell_qty = plan.recover_principal_qty
@@ -546,9 +581,12 @@ def generate_trade_advice(
                 title="尚未回本 · 耐心持有",
                 reason=f"距回本价还差 {fmt_jpy(gap)}（{abs(plan.distance_pct):.1f}%）",
                 detail=(
-                    f"回本目标价 {fmt_jpy(be)}（基于 {position.quantity:,.1f} XRP、"
-                    f"总成本 {fmt_jpy(position.total_cost_jpy)}）。"
-                    f"若 {fmt_jpy(DCA_SUGGEST_JPY)} 补仓，均价可降至 {fmt_jpy(plan.dca_breakeven_after)}。"
+                    f"回本目标价 {fmt_jpy(be)}（{position.quantity:,.1f} XRP × 均价 {fmt_jpy(be)}）。"
+                    + (
+                        f"若用 {fmt_jpy(dca_jpy)} 补仓，均价可降至 {fmt_jpy(plan.dca_breakeven_after)}。"
+                        if dca_jpy > 0
+                        else "当前无可支配资金，暂不建议加仓。"
+                    )
                 ),
             )
         )
@@ -597,11 +635,17 @@ def detect_signals(
     p = snapshot.price
     be = plan.breakeven_price
 
+    dca_jpy = plan.dca_buy_jpy
+
     if snapshot.daily_rsi < DAILY_RSI_EXTREME and at_30d_low(snapshot):
-        after = position.dca_preview(DCA_SUGGEST_JPY, p)
+        after = position.dca_preview(dca_jpy, p) if dca_jpy > 0 else position
         msg = (
             "💡【极端超跌】价格处于 30 日低位，"
-            f"可用约 {fmt_jpy(DCA_SUGGEST_JPY)} 分批买入拉低均价。"
+            + (
+                f"可用约 {fmt_jpy(dca_jpy)}（可支配 1/3）分批买入拉低均价。"
+                if dca_jpy > 0
+                else "可考虑分批买入，但当前可支配资金为 0。"
+            )
         )
         signals.append(
             Signal(
@@ -770,11 +814,13 @@ def push_signals(
 def run_monitor_cycle(
     cooldown: AlertCooldown | None = None,
     position: Position | None = None,
+    available_jpy: float | None = None,
 ) -> dict[str, Any]:
     cd = cooldown or AlertCooldown(ALERT_COOLDOWN_SECONDS)
     pos = position or load_position()
+    cash = load_available_jpy(available_jpy)
     snapshot, daily = build_snapshot()
-    plan = build_recovery_plan(snapshot, pos)
+    plan = build_recovery_plan(snapshot, pos, cash)
     advice = generate_trade_advice(snapshot, pos, plan)
     signals = detect_signals(snapshot, pos, plan)
     push_results = push_signals(signals, snapshot, cd)
@@ -782,6 +828,7 @@ def run_monitor_cycle(
         "snapshot": snapshot,
         "daily": daily,
         "position": pos,
+        "available_jpy": cash,
         "recovery_plan": plan,
         "advice": advice,
         "chart_data": build_chart_data(daily, pos),
@@ -826,6 +873,7 @@ def print_dashboard(
     advice: list[TradeAdvice],
     signals: list[Signal],
     cooldown: AlertCooldown,
+    available_jpy: float = 0.0,
 ) -> None:
     clear_screen()
     now = now_local().strftime("%Y-%m-%d %H:%M:%S")
@@ -843,8 +891,9 @@ def print_dashboard(
     print("-" * 54)
     print("我的持仓:")
     print(f"  数量: {position.quantity:,.1f} XRP")
-    print(f"  总成本: {fmt_jpy(position.total_cost_jpy)}")
     print(f"  持仓均价: {Fore.BLUE}{fmt_jpy(plan.breakeven_price)}{Style.RESET_ALL}")
+    print(f"  投入成本: {fmt_jpy(position.total_cost_jpy)}")
+    print(f"  可支配日元: {fmt_jpy(available_jpy)}（单次建议加仓 {fmt_jpy(plan.dca_buy_jpy)}）")
     print(f"  市值: {fmt_jpy(position.market_value(snapshot.price))}")
     pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
     print(f"  浮盈浮亏: {pnl_color}{fmt_jpy(pnl)} ({position.pnl_pct(snapshot.price):+.1f}%){Style.RESET_ALL}")
@@ -872,11 +921,12 @@ def main() -> None:
     init(autoreset=True)
     cooldown = AlertCooldown(ALERT_COOLDOWN_SECONDS)
     position = load_position()
+    available_jpy = load_available_jpy()
     print(f"正在启动 {PAIR_LABEL} 持仓回本监控...")
 
     while True:
         try:
-            result = run_monitor_cycle(cooldown, position)
+            result = run_monitor_cycle(cooldown, position, available_jpy)
             print_dashboard(
                 result["snapshot"],
                 result["position"],
@@ -884,6 +934,7 @@ def main() -> None:
                 result["advice"],
                 result["signals"],
                 result["cooldown"],
+                result["available_jpy"],
             )
         except requests.RequestException as exc:
             clear_screen()
