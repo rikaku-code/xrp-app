@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""XRP/JPY 长期持仓监控 — 持仓回本分析与买卖建议。"""
+"""XRP/JPY 长期持仓监控 — 120 万回本波段计划。"""
 
 import base64
 import hashlib
@@ -32,11 +32,15 @@ ALERT_COOLDOWN_SECONDS = 24 * 60 * 60
 QUIET_HOUR_START = 0
 QUIET_HOUR_END = 8
 
-# ── 持仓（通过 .env 或 Streamlit Secrets 配置）──────────────
+# ── 持仓与回本目标 ────────────────────────────────────────────
 DEFAULT_HOLDINGS_XRP = 1258.0
-DEFAULT_HOLDINGS_AVG_COST = 1_200_000 / 5_800  # 原 5800 枚 · 总成本 120 万日元
 DEFAULT_AVAILABLE_JPY = 11_000.0
+DEFAULT_TARGET_JPY = 1_200_000.0
 DCA_FRACTION = 1 / 3
+SWING_SELL_FRACTION = 0.15
+SWING_SELL_FRACTION_HIGH = 0.20
+SWING_PROFIT_PCT = 0.12
+RECOVERY_MILESTONES = (300_000, 500_000, 800_000, 1_000_000, 1_200_000)
 
 # ── 信号阈值 ────────────────────────────────────────────────
 DAILY_RSI_PERIOD = 14
@@ -59,38 +63,56 @@ FEISHU_SECRET = os.getenv("FEISHU_SECRET", "")
 
 
 @dataclass(frozen=True)
-class Position:
-    """持仓：数量 + 持仓均价（日元/XRP）。"""
+class Portfolio:
+    """当前资产：XRP 数量 + 现金 + 原始投入目标（120 万）。"""
 
-    quantity: float
-    avg_cost_jpy: float
+    xrp_quantity: float
+    cash_jpy: float
+    target_jpy: float
 
-    @property
-    def avg_cost(self) -> float:
-        return self.avg_cost_jpy
+    def xrp_value(self, price: float) -> float:
+        return self.xrp_quantity * price
 
-    @property
-    def total_cost_jpy(self) -> float:
-        return self.quantity * self.avg_cost_jpy
+    def total_assets(self, price: float) -> float:
+        return self.xrp_value(price) + self.cash_jpy
 
-    def market_value(self, price: float) -> float:
-        return self.quantity * price
-
-    def unrealized_pnl(self, price: float) -> float:
-        return self.market_value(price) - self.total_cost_jpy
+    def pnl(self, price: float) -> float:
+        return self.total_assets(price) - self.target_jpy
 
     def pnl_pct(self, price: float) -> float:
-        if self.total_cost_jpy <= 0:
+        if self.target_jpy <= 0:
             return 0.0
-        return self.unrealized_pnl(price) / self.total_cost_jpy * 100
+        return self.pnl(price) / self.target_jpy * 100
 
-    def dca_preview(self, buy_jpy: float, buy_price: float) -> "Position":
-        if buy_price <= 0 or buy_jpy <= 0:
+    def recovery_gap(self, price: float) -> float:
+        return max(0.0, self.target_jpy - self.total_assets(price))
+
+    def recovery_pct(self, price: float) -> float:
+        if self.target_jpy <= 0:
+            return 0.0
+        return min(1.0, self.total_assets(price) / self.target_jpy)
+
+    def after_buy(self, buy_jpy: float, price: float) -> "Portfolio":
+        if buy_jpy <= 0 or price <= 0:
             return self
-        added_qty = buy_jpy / buy_price
-        new_qty = self.quantity + added_qty
-        new_avg = (self.total_cost_jpy + buy_jpy) / new_qty
-        return Position(quantity=new_qty, avg_cost_jpy=new_avg)
+        spend = min(buy_jpy, self.cash_jpy)
+        if spend <= 0:
+            return self
+        return Portfolio(
+            xrp_quantity=self.xrp_quantity + spend / price,
+            cash_jpy=self.cash_jpy - spend,
+            target_jpy=self.target_jpy,
+        )
+
+    def after_sell(self, sell_qty: float, price: float) -> "Portfolio":
+        if sell_qty <= 0 or price <= 0:
+            return self
+        qty = min(sell_qty, self.xrp_quantity)
+        return Portfolio(
+            xrp_quantity=self.xrp_quantity - qty,
+            cash_jpy=self.cash_jpy + qty * price,
+            target_jpy=self.target_jpy,
+        )
 
 
 @dataclass(frozen=True)
@@ -108,17 +130,27 @@ class MarketSnapshot:
 
 
 @dataclass(frozen=True)
+class PlanStep:
+    action: str
+    trigger_price: float
+    trigger_label: str
+    amount_desc: str
+    result_desc: str
+
+
+@dataclass(frozen=True)
 class RecoveryPlan:
-    breakeven_price: float
-    distance_jpy: float
-    distance_pct: float
-    recover_principal_qty: float
-    dca_breakeven_after: float
+    total_assets: float
+    target_jpy: float
+    recovery_gap: float
+    recovery_pct: float
+    next_milestone: float
+    next_milestone_label: str
     dca_buy_jpy: float
-    milestone_50pct: float
-    milestone_80pct: float
-    sell_target_conservative: float
-    sell_target_aggressive: float
+    buy_steps: tuple[PlanStep, ...]
+    sell_steps: tuple[PlanStep, ...]
+    hold_only_price: float
+    swing_cycle_profit: float
 
 
 @dataclass(frozen=True)
@@ -166,30 +198,39 @@ def reload_config() -> None:
 reload_config()
 
 
-def load_position(
-    quantity: float | None = None,
-    avg_cost_jpy: float | None = None,
-) -> Position:
-    qty = quantity if quantity is not None else float(
+def load_portfolio(
+    xrp_quantity: float | None = None,
+    cash_jpy: float | None = None,
+    target_jpy: float | None = None,
+) -> Portfolio:
+    qty = xrp_quantity if xrp_quantity is not None else float(
         os.getenv("HOLDINGS_XRP", DEFAULT_HOLDINGS_XRP)
     )
-    avg = avg_cost_jpy if avg_cost_jpy is not None else float(
-        os.getenv("HOLDINGS_AVG_COST", DEFAULT_HOLDINGS_AVG_COST)
+    cash = cash_jpy if cash_jpy is not None else float(
+        os.getenv("AVAILABLE_JPY", DEFAULT_AVAILABLE_JPY)
     )
-    return Position(quantity=max(0.0, qty), avg_cost_jpy=max(0.0, avg))
+    target = target_jpy if target_jpy is not None else float(
+        os.getenv("TARGET_JPY", DEFAULT_TARGET_JPY)
+    )
+    return Portfolio(
+        xrp_quantity=max(0.0, qty),
+        cash_jpy=max(0.0, cash),
+        target_jpy=max(0.0, target),
+    )
 
 
-def load_available_jpy(available_jpy: float | None = None) -> float:
-    if available_jpy is not None:
-        return max(0.0, available_jpy)
-    return max(0.0, float(os.getenv("AVAILABLE_JPY", DEFAULT_AVAILABLE_JPY)))
-
-
-def suggest_dca_jpy(available_jpy: float) -> float:
-    """单次加仓建议：可支配资金的 1/3。"""
-    if available_jpy <= 0:
+def suggest_dca_jpy(cash_jpy: float) -> float:
+    if cash_jpy <= 0:
         return 0.0
-    return available_jpy * DCA_FRACTION
+    return cash_jpy * DCA_FRACTION
+
+
+def next_milestone(total_assets: float) -> tuple[float, str]:
+    for milestone in RECOVERY_MILESTONES:
+        if total_assets < milestone:
+            label = f"¥{milestone / 10_000:.0f}万"
+            return milestone, label
+    return RECOVERY_MILESTONES[-1], "¥120万（已达成）"
 
 
 COOLDOWN_FILE = os.path.join(
@@ -198,8 +239,6 @@ COOLDOWN_FILE = os.path.join(
 
 
 class AlertCooldown:
-    """同一信号类型在冷却期内最多推送一次。"""
-
     def __init__(
         self,
         cooldown_seconds: int,
@@ -259,7 +298,11 @@ def quiet_hours_label() -> str:
 
 
 def fmt_jpy(value: float) -> str:
-    return f"¥{value:,.2f}"
+    return f"¥{value:,.0f}"
+
+
+def fmt_man(value: float) -> str:
+    return f"¥{value / 10_000:.1f}万"
 
 
 def clear_screen() -> None:
@@ -384,21 +427,14 @@ def _snapshot_from_daily(price: float, daily: pd.DataFrame, source: str) -> Mark
     )
 
 
-def build_chart_data(
-    daily: pd.DataFrame,
-    position: Position,
-    limit: int = 60,
-) -> pd.DataFrame:
-    work = daily.copy()
-    chart = work.tail(limit).copy()
-    chart["date"] = pd.to_datetime(chart["timestamp"], unit="ms", errors="coerce")
-    if chart["date"].isna().all():
-        chart["date"] = pd.RangeIndex(len(chart))
-    chart = chart.set_index("date")
+def build_chart_data(daily: pd.DataFrame, limit: int = 60) -> pd.DataFrame:
+    work = daily.copy().tail(limit)
+    work["date"] = pd.to_datetime(work["timestamp"], unit="ms", errors="coerce")
+    if work["date"].isna().all():
+        work["date"] = pd.RangeIndex(len(work))
+    chart = work.set_index("date")
     chart["price"] = chart["close"]
-    if position.avg_cost > 0:
-        chart["breakeven"] = position.avg_cost
-    return chart[["price", "breakeven"]] if position.avg_cost > 0 else chart[["price"]]
+    return chart[["price"]]
 
 
 def build_snapshot() -> tuple[MarketSnapshot, pd.DataFrame]:
@@ -445,76 +481,144 @@ def at_30d_low(snapshot: MarketSnapshot) -> bool:
     return snapshot.price <= threshold
 
 
+
 def build_recovery_plan(
     snapshot: MarketSnapshot,
-    position: Position,
-    available_jpy: float,
+    portfolio: Portfolio,
 ) -> RecoveryPlan:
-    be = position.avg_cost
-    dist = snapshot.price - be
-    dist_pct = (dist / be * 100) if be > 0 else 0.0
-    dca_jpy = suggest_dca_jpy(available_jpy)
+    p = snapshot.price
+    total = portfolio.total_assets(p)
+    gap = portfolio.recovery_gap(p)
+    pct = portfolio.recovery_pct(p)
+    dca_jpy = suggest_dca_jpy(portfolio.cash_jpy)
+    milestone, milestone_label = next_milestone(total)
 
-    recover_qty = (
-        position.total_cost_jpy / snapshot.price if snapshot.price > 0 else 0.0
-    )
-    after_dca = position.dca_preview(dca_jpy, snapshot.price)
+    hold_price = 0.0
+    if portfolio.xrp_quantity > 0:
+        need = portfolio.target_jpy - portfolio.cash_jpy
+        hold_price = max(0.0, need / portfolio.xrp_quantity)
 
-    loss = max(0.0, -position.unrealized_pnl(snapshot.price))
-    milestone_50 = snapshot.price + (loss * 0.5 / position.quantity if position.quantity > 0 else 0)
-    milestone_80 = snapshot.price + (loss * 0.8 / position.quantity if position.quantity > 0 else 0)
+    swing_profit = dca_jpy * SWING_PROFIT_PCT if dca_jpy > 0 else 0.0
+
+    buy_steps: list[PlanStep] = []
+    sell_steps: list[PlanStep] = []
+
+    buy_levels = [
+        (snapshot.low_30d, "30日低点", dca_jpy, "RSI<25 极端超跌"),
+        (snapshot.bb_lower, "布林带下轨", dca_jpy / 2 if dca_jpy else 0, "RSI<30 超卖"),
+        (p * 0.97, "当前价 -3%", dca_jpy / 3 if dca_jpy else 0, "回调分批"),
+    ]
+    for trigger, label, amount, cond in buy_levels:
+        if amount <= 0:
+            continue
+        after = portfolio.after_buy(amount, trigger)
+        buy_steps.append(
+            PlanStep(
+                action="买入",
+                trigger_price=trigger,
+                trigger_label=f"{label}（{cond}）",
+                amount_desc=f"投入 {fmt_jpy(amount)}",
+                result_desc=(
+                    f"预计总资产 {fmt_man(after.total_assets(trigger))} · "
+                    f"距120万还差 {fmt_man(portfolio.target_jpy - after.total_assets(trigger))}"
+                ),
+            )
+        )
+
+    sell_levels = [
+        (snapshot.ma20, "MA20", SWING_SELL_FRACTION, "反弹第一阻力"),
+        (snapshot.ma50, "MA50", SWING_SELL_FRACTION, "反弹第二阻力"),
+        (snapshot.high_30d, "30日高点", SWING_SELL_FRACTION_HIGH, "RSI>65 分批止盈"),
+    ]
+    for trigger, label, fraction, cond in sell_levels:
+        if trigger <= p:
+            continue
+        sell_qty = portfolio.xrp_quantity * fraction
+        proceeds = sell_qty * trigger
+        after = portfolio.after_sell(sell_qty, trigger)
+        sell_steps.append(
+            PlanStep(
+                action="卖出",
+                trigger_price=trigger,
+                trigger_label=f"{label}（{cond}）",
+                amount_desc=f"卖出 {sell_qty:,.0f} XRP → {fmt_jpy(proceeds)}",
+                result_desc=(
+                    f"落袋现金 {fmt_jpy(after.cash_jpy)} · "
+                    f"剩余 {after.xrp_quantity:,.0f} XRP · "
+                    f"总资产 {fmt_man(after.total_assets(trigger))}"
+                ),
+            )
+        )
+
+    buy_steps.sort(key=lambda s: s.trigger_price)
+    sell_steps.sort(key=lambda s: s.trigger_price)
 
     return RecoveryPlan(
-        breakeven_price=be,
-        distance_jpy=dist,
-        distance_pct=dist_pct,
-        recover_principal_qty=min(recover_qty, position.quantity),
-        dca_breakeven_after=after_dca.avg_cost,
+        total_assets=total,
+        target_jpy=portfolio.target_jpy,
+        recovery_gap=gap,
+        recovery_pct=pct,
+        next_milestone=milestone,
+        next_milestone_label=milestone_label,
         dca_buy_jpy=dca_jpy,
-        milestone_50pct=milestone_50,
-        milestone_80pct=milestone_80,
-        sell_target_conservative=max(be, snapshot.ma20),
-        sell_target_aggressive=min(snapshot.high_30d, be * 1.15) if be > 0 else snapshot.high_30d,
+        buy_steps=tuple(buy_steps),
+        sell_steps=tuple(sell_steps),
+        hold_only_price=hold_price,
+        swing_cycle_profit=swing_profit,
     )
 
 
 def generate_trade_advice(
     snapshot: MarketSnapshot,
-    position: Position,
+    portfolio: Portfolio,
     plan: RecoveryPlan,
 ) -> list[TradeAdvice]:
     advice: list[TradeAdvice] = []
     p = snapshot.price
-    be = plan.breakeven_price
     rsi = snapshot.daily_rsi
-
     dca_jpy = plan.dca_buy_jpy
+    total = plan.total_assets
 
-    if position.quantity <= 0 or position.avg_cost_jpy <= 0:
+    if portfolio.target_jpy <= 0:
         advice.append(
             TradeAdvice(
                 action="配置",
                 strength="请先",
-                title="设置持仓",
-                reason="尚未配置 XRP 数量与持仓均价",
-                detail="在侧边栏或 .env 填写 HOLDINGS_XRP 和 HOLDINGS_AVG_COST",
+                title="设置回本目标",
+                reason="尚未配置原始投入目标",
+                detail="在侧边栏填写 TARGET_JPY（如 1200000）",
             )
         )
         return advice
 
+    advice.append(
+        TradeAdvice(
+            action="持有",
+            strength="总览",
+            title=f"目标 {fmt_man(portfolio.target_jpy)} · 当前 {fmt_man(total)}",
+            reason=f"总盈亏 {fmt_jpy(portfolio.pnl(p))}（{portfolio.pnl_pct(p):+.1f}%）· 还差 {fmt_man(plan.recovery_gap)}",
+            detail=(
+                f"纯持有需 XRP 涨至约 {fmt_jpy(plan.hold_only_price)}/枚 才能回到120万；"
+                f"仅靠 {fmt_jpy(portfolio.cash_jpy)} 现金波段每次约赚 {fmt_jpy(plan.swing_cycle_profit)}，"
+                f"需配合价格上涨 + 低吸高抛。"
+            ),
+        )
+    )
+
     if rsi < DAILY_RSI_EXTREME and at_30d_low(snapshot):
         if dca_jpy > 0:
-            after = position.dca_preview(dca_jpy, p)
+            after = portfolio.after_buy(dca_jpy, p)
             advice.append(
                 TradeAdvice(
                     action="买入",
                     strength="强烈建议",
-                    title="极端超跌 · 分批加仓",
-                    reason=f"RSI {rsi:.1f} 且价格贴近 30 日低点",
+                    title="极端超跌 · 执行低吸",
+                    reason=f"RSI {rsi:.1f}，价格贴近 30 日低点 {fmt_jpy(snapshot.low_30d)}",
                     detail=(
-                        f"可用约 {fmt_jpy(dca_jpy)}（可支配资金的 1/3）挂限价单低吸。"
-                        f"若成交，持仓均价将从 {fmt_jpy(be)} 降至约 {fmt_jpy(after.avg_cost)}，"
-                        f"更快接近回本。"
+                        f"用 {fmt_jpy(dca_jpy)}（现金 1/3）买入约 {dca_jpy / p:.1f} XRP。"
+                        f"买入后总持仓 {after.xrp_quantity:,.0f} 枚，"
+                        f"总资产 {fmt_man(after.total_assets(p))}。"
+                        f"等反弹至 MA20 {fmt_jpy(snapshot.ma20)} 再卖 15% 做波段。"
                     ),
                 )
             )
@@ -522,104 +626,67 @@ def generate_trade_advice(
             advice.append(
                 TradeAdvice(
                     action="买入",
-                    strength="强烈建议",
-                    title="极端超跌 · 分批加仓",
-                    reason=f"RSI {rsi:.1f} 且价格贴近 30 日低点",
-                    detail="当前可支配资金为 0，请补充日元后再考虑加仓。",
+                    strength="信号出现",
+                    title="极端超跌 · 但现金不足",
+                    reason=f"RSI {rsi:.1f}，价格处于低位",
+                    detail="当前现金为 0，无法执行低吸。如有余力可补充日元。",
                 )
             )
-    elif rsi < RSI_OVERSOLD and p <= snapshot.bb_lower * 1.02:
-        small_buy = dca_jpy / 2 if dca_jpy > 0 else 0.0
-        if small_buy > 0:
-            after = position.dca_preview(small_buy, p)
+    elif rsi < RSI_OVERSOLD and p <= snapshot.bb_lower * 1.02 and dca_jpy > 0:
+        half = dca_jpy / 2
+        advice.append(
+            TradeAdvice(
+                action="买入",
+                strength="可考虑",
+                title="超卖区 · 小仓试探",
+                reason=f"RSI {rsi:.1f}，接近布林带下轨",
+                detail=f"非极端低位，建议只用 {fmt_jpy(half)} 试探，保留子弹等更深回调。",
+            )
+        )
+
+    for step in plan.sell_steps[:2]:
+        if p >= step.trigger_price * 0.98:
             advice.append(
                 TradeAdvice(
-                    action="买入",
-                    strength="可考虑",
-                    title="超卖区 · 小仓补仓",
-                    reason=f"RSI {rsi:.1f}，价格接近布林带下轨",
-                    detail=(
-                        f"非极端低位，建议只用约 {fmt_jpy(small_buy)}。"
-                        f"补仓后均价约 {fmt_jpy(after.avg_cost)}。"
-                    ),
+                    action="卖出",
+                    strength="准备",
+                    title=f"接近 {step.trigger_label}",
+                    reason=f"价格 {fmt_jpy(p)} 逼近卖出位 {fmt_jpy(step.trigger_price)}",
+                    detail=step.amount_desc + "。" + step.result_desc + "。卖出后等下次超跌再买回。",
                 )
             )
+            break
 
-    if p >= be and position.unrealized_pnl(p) >= 0:
-        sell_qty = plan.recover_principal_qty
+    if rsi >= RSI_OVERBOUGHT and p >= snapshot.ma20:
+        sell_qty = portfolio.xrp_quantity * SWING_SELL_FRACTION
         advice.append(
             TradeAdvice(
                 action="卖出",
                 strength="建议",
-                title="已达回本价 · 回收本金",
-                reason=f"当前 {fmt_jpy(p)} ≥ 均价 {fmt_jpy(be)}",
+                title="超买反弹 · 分批高抛",
+                reason=f"RSI {rsi:.1f}，价格高于 MA20",
                 detail=(
-                    f"可卖出约 {sell_qty:,.1f} XRP 回收 {fmt_jpy(position.total_cost_jpy)} 本金，"
-                    f"剩余 {position.quantity - sell_qty:,.1f} XRP 当作零成本持仓继续拿。"
+                    f"卖出约 {sell_qty:,.0f} XRP（15%）锁定 {fmt_jpy(sell_qty * p)} 现金。"
+                    f"不追求一次回本，积少成多，等下次低位接回。"
                 ),
             )
         )
-        if rsi >= RSI_OVERBOUGHT:
-            advice.append(
-                TradeAdvice(
-                    action="卖出",
-                    strength="可选",
-                    title="超买区 · 分批止盈",
-                    reason=f"RSI {rsi:.1f} 进入超买，且已回本",
-                    detail=(
-                        f"可在 {fmt_jpy(plan.sell_target_aggressive)} 附近再卖 20–30%，"
-                        f"锁定部分利润，降低回撤风险。"
-                    ),
-                )
-            )
-    elif p < be:
-        gap = be - p
-        advice.append(
-            TradeAdvice(
-                action="持有",
-                strength="当前",
-                title="尚未回本 · 耐心持有",
-                reason=f"距回本价还差 {fmt_jpy(gap)}（{abs(plan.distance_pct):.1f}%）",
-                detail=(
-                    f"回本目标价 {fmt_jpy(be)}（{position.quantity:,.1f} XRP × 均价 {fmt_jpy(be)}）。"
-                    + (
-                        f"若用 {fmt_jpy(dca_jpy)} 补仓，均价可降至 {fmt_jpy(plan.dca_breakeven_after)}。"
-                        if dca_jpy > 0
-                        else "当前无可支配资金，暂不建议加仓。"
-                    )
-                ),
-            )
-        )
-        if p >= plan.milestone_50pct and p < be:
-            advice.append(
-                TradeAdvice(
-                    action="持有",
-                    strength="进展",
-                    title="反弹途中 · 勿追涨杀跌",
-                    reason=f"已从低点反弹，但仍低于回本价 {fmt_jpy(be)}",
-                    detail="反弹阶段不建议割肉；等待回本价或极端超跌再加仓。",
-                )
-            )
 
-    if snapshot.macd_hist > 0 and p > snapshot.ma20 and p < be:
-        advice.append(
-            TradeAdvice(
-                action="观望",
-                strength="短期",
-                title="趋势转强 · 暂不加仓",
-                reason="MACD 多头且站上 MA20，但未到回本价",
-                detail=f"等价格接近 {fmt_jpy(be)} 或再次极端超跌时再操作。",
-            )
-        )
-
-    if not advice:
+    if not any(a.action in ("买入", "卖出") for a in advice[1:]):
+        next_buy = plan.buy_steps[0] if plan.buy_steps else None
+        next_sell = plan.sell_steps[0] if plan.sell_steps else None
+        parts = []
+        if next_buy:
+            parts.append(f"低吸位 {fmt_jpy(next_buy.trigger_price)}（{next_buy.trigger_label}）")
+        if next_sell:
+            parts.append(f"高抛位 {fmt_jpy(next_sell.trigger_price)}（{next_sell.trigger_label}）")
         advice.append(
             TradeAdvice(
                 action="观望",
                 strength="当前",
-                title="无明确信号",
-                reason="市场处于常规波动区间",
-                detail=f"继续持有，关注回本价 {fmt_jpy(be)} 与 30 日区间 {fmt_jpy(snapshot.low_30d)}–{fmt_jpy(snapshot.high_30d)}。",
+                title="等待触发 · 勿频繁操作",
+                reason=f"下一目标：{plan.next_milestone_label}（还差 {fmt_man(plan.next_milestone - total)}）",
+                detail=" · ".join(parts) if parts else "保持现有仓位，按 plan 表执行。",
             )
         )
 
@@ -628,80 +695,50 @@ def generate_trade_advice(
 
 def detect_signals(
     snapshot: MarketSnapshot,
-    position: Position,
+    portfolio: Portfolio,
     plan: RecoveryPlan,
 ) -> list[Signal]:
     signals: list[Signal] = []
     p = snapshot.price
-    be = plan.breakeven_price
-
     dca_jpy = plan.dca_buy_jpy
 
     if snapshot.daily_rsi < DAILY_RSI_EXTREME and at_30d_low(snapshot):
-        after = position.dca_preview(dca_jpy, p) if dca_jpy > 0 else position
         msg = (
-            "💡【极端超跌】价格处于 30 日低位，"
-            + (
-                f"可用约 {fmt_jpy(dca_jpy)}（可支配 1/3）分批买入拉低均价。"
-                if dca_jpy > 0
-                else "可考虑分批买入，但当前可支配资金为 0。"
-            )
+            f"💡【极端超跌】可用 {fmt_jpy(dca_jpy)} 低吸，"
+            f"目标 {plan.next_milestone_label}（当前 {fmt_man(plan.total_assets)}）"
+            if dca_jpy > 0
+            else "💡【极端超跌】价格处于低位，但当前现金不足"
         )
         signals.append(
             Signal(
                 key="extreme_oversold",
-                title="极端超跌 · 加仓机会",
+                title="极端超跌 · 低吸",
                 console_msg=msg,
                 card_template="green",
                 card_body=(
                     f"{msg}\n\n"
-                    f"**当前价格：** {fmt_jpy(p)}\n"
-                    f"**日线 RSI：** {snapshot.daily_rsi:.1f}\n"
-                    f"**持仓均价：** {fmt_jpy(be)}\n"
-                    f"**补仓后预估均价：** {fmt_jpy(after.avg_cost)}"
+                    f"**价格：** {fmt_jpy(p)} · RSI {snapshot.daily_rsi:.1f}\n"
+                    f"**总资产：** {fmt_man(plan.total_assets)} / 目标 {fmt_man(plan.target_jpy)}\n"
+                    f"**还差：** {fmt_man(plan.recovery_gap)}"
                 ),
                 color=f"{Fore.GREEN}{Style.BRIGHT}",
             )
         )
 
-    if be > 0 and p >= be and position.unrealized_pnl(p) >= 0:
-        sell_qty = plan.recover_principal_qty
-        msg = f"🎉【回本】价格已达持仓均价 {fmt_jpy(be)}，可考虑回收本金。"
+    if plan.recovery_gap <= 0:
+        msg = f"🎉【回本】总资产已达 {fmt_man(plan.total_assets)}，超过 120 万目标！"
         signals.append(
             Signal(
-                key="breakeven_reached",
-                title="回本提醒",
+                key="target_reached",
+                title="120万目标达成",
                 console_msg=msg,
                 card_template="orange",
                 card_body=(
                     f"{msg}\n\n"
-                    f"**当前价格：** {fmt_jpy(p)}\n"
-                    f"**持仓：** {position.quantity:,.1f} XRP · 总成本 {fmt_jpy(position.total_cost_jpy)}\n"
-                    f"**浮盈：** {fmt_jpy(position.unrealized_pnl(p))}\n"
-                    f"**建议：** 卖出约 {sell_qty:,.1f} XRP 回收本金，其余零成本持有"
+                    f"**XRP：** {portfolio.xrp_quantity:,.0f} 枚 · **现金：** {fmt_jpy(portfolio.cash_jpy)}\n"
+                    f"**总盈亏：** {fmt_jpy(portfolio.pnl(p))}"
                 ),
                 color=f"{Fore.YELLOW}{Style.BRIGHT}",
-            )
-        )
-
-    if be > 0 and p >= plan.milestone_80pct and p < be:
-        msg = (
-            f"📈【反弹进展】价格 {fmt_jpy(p)}，"
-            f"距回本 {fmt_jpy(be)} 还差 {fmt_jpy(be - p)}。"
-        )
-        signals.append(
-            Signal(
-                key="recovery_progress",
-                title="反弹进展",
-                console_msg=msg,
-                card_template="blue",
-                card_body=(
-                    f"{msg}\n\n"
-                    f"**持仓浮亏：** {fmt_jpy(position.unrealized_pnl(p))}\n"
-                    f"**30 日区间：** {fmt_jpy(snapshot.low_30d)} – {fmt_jpy(snapshot.high_30d)}\n"
-                    f"**建议：** 持有观望，勿频繁操作"
-                ),
-                color=f"{Fore.CYAN}{Style.BRIGHT}",
             )
         )
 
@@ -813,25 +850,22 @@ def push_signals(
 
 def run_monitor_cycle(
     cooldown: AlertCooldown | None = None,
-    position: Position | None = None,
-    available_jpy: float | None = None,
+    portfolio: Portfolio | None = None,
 ) -> dict[str, Any]:
     cd = cooldown or AlertCooldown(ALERT_COOLDOWN_SECONDS)
-    pos = position or load_position()
-    cash = load_available_jpy(available_jpy)
+    pf = portfolio or load_portfolio()
     snapshot, daily = build_snapshot()
-    plan = build_recovery_plan(snapshot, pos, cash)
-    advice = generate_trade_advice(snapshot, pos, plan)
-    signals = detect_signals(snapshot, pos, plan)
+    plan = build_recovery_plan(snapshot, pf)
+    advice = generate_trade_advice(snapshot, pf, plan)
+    signals = detect_signals(snapshot, pf, plan)
     push_results = push_signals(signals, snapshot, cd)
     return {
         "snapshot": snapshot,
         "daily": daily,
-        "position": pos,
-        "available_jpy": cash,
+        "portfolio": pf,
         "recovery_plan": plan,
         "advice": advice,
-        "chart_data": build_chart_data(daily, pos),
+        "chart_data": build_chart_data(daily),
         "signals": signals,
         "push_results": push_results,
         "cooldown": cd,
@@ -868,39 +902,46 @@ def print_signals(signals: list[Signal], cooldown: AlertCooldown) -> None:
 
 def print_dashboard(
     snapshot: MarketSnapshot,
-    position: Position,
+    portfolio: Portfolio,
     plan: RecoveryPlan,
     advice: list[TradeAdvice],
     signals: list[Signal],
     cooldown: AlertCooldown,
-    available_jpy: float = 0.0,
 ) -> None:
     clear_screen()
     now = now_local().strftime("%Y-%m-%d %H:%M:%S")
     push_status = "飞书 Lark" if FEISHU_WEBHOOK_URL else "未配置"
-    pnl = position.unrealized_pnl(snapshot.price)
+    p = snapshot.price
+    pnl = portfolio.pnl(p)
 
     print(f"{Fore.GREEN}{Style.BRIGHT}{'=' * 54}{Style.RESET_ALL}")
-    print(f"{Fore.GREEN}{Style.BRIGHT}  {PAIR_LABEL} 持仓回本监控{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}{Style.BRIGHT}  {PAIR_LABEL} 120万回本波段计划{Style.RESET_ALL}")
     print(f"{Fore.GREEN}{Style.BRIGHT}{'=' * 54}{Style.RESET_ALL}")
     print(f"更新时间: {now}  |  数据源: {snapshot.data_source}")
-    print(f"推送: {push_status}  |  冷却: 24h/信号  |  静默: {quiet_hours_label()}")
+    print(f"推送: {push_status}  |  RSI: {snapshot.daily_rsi:.1f}")
     print("-" * 54)
-    print(f"当前价格: {Fore.WHITE}{Style.BRIGHT}{fmt_jpy(snapshot.price)}{Style.RESET_ALL}")
-    print(f"日线 RSI: {Fore.MAGENTA}{snapshot.daily_rsi:.1f}{Style.RESET_ALL}")
+    print(f"当前价格: {Fore.WHITE}{Style.BRIGHT}{fmt_jpy(p)}{Style.RESET_ALL}")
     print("-" * 54)
-    print("我的持仓:")
-    print(f"  数量: {position.quantity:,.1f} XRP")
-    print(f"  持仓均价: {Fore.BLUE}{fmt_jpy(plan.breakeven_price)}{Style.RESET_ALL}")
-    print(f"  投入成本: {fmt_jpy(position.total_cost_jpy)}")
-    print(f"  可支配日元: {fmt_jpy(available_jpy)}（单次建议加仓 {fmt_jpy(plan.dca_buy_jpy)}）")
-    print(f"  市值: {fmt_jpy(position.market_value(snapshot.price))}")
+    print("资产概况:")
+    print(f"  XRP: {portfolio.xrp_quantity:,.0f} 枚 ({fmt_jpy(portfolio.xrp_value(p))})")
+    print(f"  现金: {fmt_jpy(portfolio.cash_jpy)}")
+    print(f"  总资产: {Fore.WHITE}{Style.BRIGHT}{fmt_man(plan.total_assets)}{Style.RESET_ALL}")
+    print(f"  目标: {fmt_man(portfolio.target_jpy)}  |  还差: {fmt_man(plan.recovery_gap)}")
     pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
-    print(f"  浮盈浮亏: {pnl_color}{fmt_jpy(pnl)} ({position.pnl_pct(snapshot.price):+.1f}%){Style.RESET_ALL}")
-    print(f"  距回本: {fmt_jpy(plan.distance_jpy)} ({plan.distance_pct:+.1f}%)")
+    print(f"  总盈亏: {pnl_color}{fmt_jpy(pnl)} ({portfolio.pnl_pct(p):+.1f}%){Style.RESET_ALL}")
+    print(f"  进度: {plan.recovery_pct * 100:.1f}% → 下一目标 {plan.next_milestone_label}")
     print("-" * 54)
     print("买卖建议:")
     print_advice(advice)
+    print("-" * 54)
+    if plan.buy_steps:
+        print("低吸计划:")
+        for step in plan.buy_steps:
+            print(f"  {fmt_jpy(step.trigger_price)} {step.trigger_label}: {step.amount_desc}")
+    if plan.sell_steps:
+        print("高抛计划:")
+        for step in plan.sell_steps:
+            print(f"  {fmt_jpy(step.trigger_price)} {step.trigger_label}: {step.amount_desc}")
     print("-" * 54)
     print("Lark 信号:")
     print_signals(signals, cooldown)
@@ -920,21 +961,19 @@ def main() -> None:
     _configure_console_encoding()
     init(autoreset=True)
     cooldown = AlertCooldown(ALERT_COOLDOWN_SECONDS)
-    position = load_position()
-    available_jpy = load_available_jpy()
-    print(f"正在启动 {PAIR_LABEL} 持仓回本监控...")
+    portfolio = load_portfolio()
+    print(f"正在启动 {PAIR_LABEL} 120万回本波段监控...")
 
     while True:
         try:
-            result = run_monitor_cycle(cooldown, position, available_jpy)
+            result = run_monitor_cycle(cooldown, portfolio)
             print_dashboard(
                 result["snapshot"],
-                result["position"],
+                result["portfolio"],
                 result["recovery_plan"],
                 result["advice"],
                 result["signals"],
                 result["cooldown"],
-                result["available_jpy"],
             )
         except requests.RequestException as exc:
             clear_screen()
