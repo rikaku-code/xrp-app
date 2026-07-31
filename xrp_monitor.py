@@ -41,6 +41,15 @@ DAILY_RSI_PERIOD = 14
 DAILY_RSI_EXTREME = 25
 LOW_LOOKBACK_DAYS = 30
 LOW_TOUCH_TOLERANCE = 0.01
+MA_SHORT = 20
+MA_LONG = 50
+BB_PERIOD = 20
+BB_STD = 2.0
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Tokyo")
 
 FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", "")
@@ -52,6 +61,15 @@ class MarketSnapshot:
     price: float
     daily_rsi: float
     low_30d: float
+    high_30d: float
+    ma20: float
+    ma50: float
+    macd: float
+    macd_signal: float
+    macd_hist: float
+    bb_upper: float
+    bb_middle: float
+    bb_lower: float
     data_source: str
 
 
@@ -249,27 +267,86 @@ def fetch_coingecko_daily(days: int = 90) -> tuple[float, pd.DataFrame]:
     return price, df
 
 
+def rsi_zone(rsi: float) -> str:
+    if rsi >= RSI_OVERBOUGHT:
+        return "超买"
+    if rsi <= RSI_OVERSOLD:
+        return "超卖"
+    return "中性"
+
+
+def macd_trend(macd_hist: float) -> str:
+    return "多头" if macd_hist > 0 else "空头"
+
+
+def bb_position(price: float, upper: float, lower: float) -> str:
+    if price >= upper:
+        return "触及上轨"
+    if price <= lower:
+        return "触及下轨"
+    return "轨道内"
+
+
+def ma_trend(price: float, ma20: float, ma50: float) -> str:
+    if price > ma20 > ma50:
+        return "多头排列"
+    if price < ma20 < ma50:
+        return "空头排列"
+    return "震荡"
+
+
 def _snapshot_from_daily(price: float, daily: pd.DataFrame, source: str) -> MarketSnapshot:
     rsi_series = ta.momentum.RSIIndicator(
         close=daily["close"], window=DAILY_RSI_PERIOD
     ).rsi()
-    daily_rsi = float(rsi_series.iloc[-1])
-    low_30d = float(daily["low"].tail(LOW_LOOKBACK_DAYS).min())
+    ma20_series = daily["close"].rolling(window=MA_SHORT).mean()
+    ma50_series = daily["close"].rolling(window=MA_LONG).mean()
+    macd_ind = ta.trend.MACD(
+        close=daily["close"],
+        window_slow=MACD_SLOW,
+        window_fast=MACD_FAST,
+        window_sign=MACD_SIGNAL,
+    )
+    bb_ind = ta.volatility.BollingerBands(
+        close=daily["close"], window=BB_PERIOD, window_dev=BB_STD
+    )
+
+    tail = daily.tail(LOW_LOOKBACK_DAYS)
     return MarketSnapshot(
         price=price,
-        daily_rsi=daily_rsi,
-        low_30d=low_30d,
+        daily_rsi=float(rsi_series.iloc[-1]),
+        low_30d=float(tail["low"].min()),
+        high_30d=float(tail["high"].max()),
+        ma20=float(ma20_series.iloc[-1]),
+        ma50=float(ma50_series.iloc[-1]),
+        macd=float(macd_ind.macd().iloc[-1]),
+        macd_signal=float(macd_ind.macd_signal().iloc[-1]),
+        macd_hist=float(macd_ind.macd_diff().iloc[-1]),
+        bb_upper=float(bb_ind.bollinger_hband().iloc[-1]),
+        bb_middle=float(bb_ind.bollinger_mavg().iloc[-1]),
+        bb_lower=float(bb_ind.bollinger_lband().iloc[-1]),
         data_source=source,
     )
 
 
-def build_snapshot() -> MarketSnapshot:
+def build_chart_data(daily: pd.DataFrame, limit: int = 60) -> pd.DataFrame:
+    work = daily.copy()
+    work["ma20"] = work["close"].rolling(window=MA_SHORT).mean()
+    work["ma50"] = work["close"].rolling(window=MA_LONG).mean()
+    chart = work.dropna(subset=["ma20", "ma50"]).tail(limit).copy()
+    chart["date"] = pd.to_datetime(chart["timestamp"], unit="ms", errors="coerce")
+    if chart["date"].isna().all():
+        chart["date"] = pd.RangeIndex(len(chart))
+    return chart.set_index("date")[["close", "ma20", "ma50"]]
+
+
+def build_snapshot() -> tuple[MarketSnapshot, pd.DataFrame]:
     errors: list[str] = []
 
     try:
         price = fetch_bitbank_ticker()
         daily = fetch_bitbank_daily()
-        return _snapshot_from_daily(price, daily, "Bitbank")
+        return _snapshot_from_daily(price, daily, "Bitbank"), daily
     except requests.RequestException as exc:
         errors.append(f"Bitbank: {exc}")
 
@@ -277,7 +354,7 @@ def build_snapshot() -> MarketSnapshot:
         price, daily = fetch_coingecko_daily(
             days=max(LOW_LOOKBACK_DAYS + DAILY_RSI_PERIOD + 5, 90)
         )
-        return _snapshot_from_daily(price, daily, "CoinGecko")
+        return _snapshot_from_daily(price, daily, "CoinGecko"), daily
     except requests.RequestException as exc:
         errors.append(f"CoinGecko: {exc}")
 
@@ -285,7 +362,17 @@ def build_snapshot() -> MarketSnapshot:
         intraday = fetch_binance_klines("15m", 5)
         daily = fetch_binance_klines("1d", max(LOW_LOOKBACK_DAYS + DAILY_RSI_PERIOD, 60))
         price = float(intraday["close"].iloc[-1])
-        return _snapshot_from_daily(price, daily, "Binance")
+        binance_daily = pd.DataFrame(
+            {
+                "open": daily["open"],
+                "high": daily["high"],
+                "low": daily["low"],
+                "close": daily["close"],
+                "volume": daily["volume"],
+                "timestamp": daily["open_time"],
+            }
+        )
+        return _snapshot_from_daily(price, binance_daily, "Binance"), binance_daily
     except requests.RequestException as exc:
         errors.append(f"Binance: {exc}")
 
@@ -477,11 +564,13 @@ def run_monitor_cycle(
 ) -> dict[str, Any]:
     """执行一次监控周期，供 CLI 与 Streamlit 共用。"""
     cd = cooldown or AlertCooldown(ALERT_COOLDOWN_SECONDS)
-    snapshot = build_snapshot()
+    snapshot, daily = build_snapshot()
     signals = detect_signals(snapshot)
     push_results = push_signals(signals, snapshot, cd)
     return {
         "snapshot": snapshot,
+        "daily": daily,
+        "chart_data": build_chart_data(daily),
         "signals": signals,
         "push_results": push_results,
         "cooldown": cd,
@@ -521,11 +610,26 @@ def print_dashboard(
     print(f"当前价格: {Fore.WHITE}{Style.BRIGHT}¥{snapshot.price:,.2f}{Style.RESET_ALL}")
     print(
         f"日线 RSI({DAILY_RSI_PERIOD}): "
-        f"{Fore.MAGENTA}{Style.BRIGHT}{snapshot.daily_rsi:.2f}{Style.RESET_ALL}"
+        f"{Fore.MAGENTA}{Style.BRIGHT}{snapshot.daily_rsi:.2f} "
+        f"({rsi_zone(snapshot.daily_rsi)}){Style.RESET_ALL}"
     )
     print(
-        f"近{LOW_LOOKBACK_DAYS}日最低: "
-        f"{Fore.YELLOW}{Style.BRIGHT}¥{snapshot.low_30d:,.2f}{Style.RESET_ALL}"
+        f"MA{MA_SHORT}/MA{MA_LONG}: "
+        f"{Fore.BLUE}¥{snapshot.ma20:,.2f} / ¥{snapshot.ma50:,.2f} "
+        f"({ma_trend(snapshot.price, snapshot.ma20, snapshot.ma50)}){Style.RESET_ALL}"
+    )
+    print(
+        f"MACD 柱: {Fore.CYAN}{snapshot.macd_hist:+.4f} "
+        f"({macd_trend(snapshot.macd_hist)}){Style.RESET_ALL}"
+    )
+    print(
+        f"布林带: {Fore.YELLOW}¥{snapshot.bb_lower:,.2f} – "
+        f"¥{snapshot.bb_upper:,.2f} ({bb_position(snapshot.price, snapshot.bb_upper, snapshot.bb_lower)})"
+        f"{Style.RESET_ALL}"
+    )
+    print(
+        f"近{LOW_LOOKBACK_DAYS}日区间: "
+        f"¥{snapshot.low_30d:,.2f} – ¥{snapshot.high_30d:,.2f}"
     )
     print(f"反弹阶梯: {Fore.CYAN}¥{REBOUND_PRICE}{Style.RESET_ALL}")
     print(f"我的成本: {Fore.BLUE}¥{MY_COST_PRICE}{Style.RESET_ALL}")

@@ -46,6 +46,47 @@ def append_alert_log(message: str, level: str = "info") -> None:
     st.session_state.alert_log = st.session_state.alert_log[:30]
 
 
+def render_technical_indicators(snapshot: monitor.MarketSnapshot) -> None:
+    st.subheader("技术指标")
+    row1 = st.columns(4)
+    row1[0].metric(
+        f"RSI({monitor.DAILY_RSI_PERIOD})",
+        f"{snapshot.daily_rsi:.1f}",
+        monitor.rsi_zone(snapshot.daily_rsi),
+    )
+    row1[1].metric("MA20", f"¥{snapshot.ma20:,.2f}")
+    row1[2].metric("MA50", f"¥{snapshot.ma50:,.2f}")
+    row1[3].metric("均线趋势", monitor.ma_trend(snapshot.price, snapshot.ma20, snapshot.ma50))
+
+    row2 = st.columns(4)
+    row2[0].metric("MACD", f"{snapshot.macd:+.3f}")
+    row2[1].metric("MACD 信号", f"{snapshot.macd_signal:+.3f}")
+    row2[2].metric("MACD 柱", f"{snapshot.macd_hist:+.3f}", monitor.macd_trend(snapshot.macd_hist))
+    row2[3].metric(
+        "布林带",
+        monitor.bb_position(snapshot.price, snapshot.bb_upper, snapshot.bb_lower),
+        delta=f"¥{snapshot.bb_lower:,.0f}–¥{snapshot.bb_upper:,.0f}",
+    )
+
+    row3 = st.columns(3)
+    row3[0].metric("30日最低", f"¥{snapshot.low_30d:,.2f}")
+    row3[1].metric("30日最高", f"¥{snapshot.high_30d:,.2f}")
+    dist_cost = snapshot.price - monitor.MY_COST_PRICE
+    row3[2].metric(
+        "距成本价",
+        f"{'+' if dist_cost >= 0 else ''}{dist_cost:,.2f} JPY",
+        delta=f"成本 ¥{monitor.MY_COST_PRICE}",
+        delta_color="normal" if dist_cost >= 0 else "inverse",
+    )
+
+
+def render_price_chart(chart_data) -> None:
+    if chart_data is None or chart_data.empty:
+        return
+    st.subheader("价格与均线（近 60 日）")
+    st.line_chart(chart_data, height=280)
+
+
 def render_signal_conditions(snapshot: monitor.MarketSnapshot) -> None:
     st.subheader("触发条件检查")
     cols = st.columns(3)
@@ -137,13 +178,6 @@ def handle_push_results(push_results: list[dict]) -> None:
 
 def render_monitor_panel(refresh_seconds: int) -> None:
     st.title("XRP/JPY 长期持仓监控")
-    st.caption(
-        f"Binance 实时数据 · 飞书 Lark 推送 · 自动刷新 {refresh_seconds} 秒 · "
-        f"每信号 {monitor.ALERT_COOLDOWN_SECONDS // 3600} 小时冷却 · "
-        f"静默 {monitor.quiet_hours_label()}"
-    )
-    if monitor.is_quiet_hours():
-        st.info(f"🌙 当前为静默时段（{monitor.quiet_hours_label()}），Lark 暂不推送。")
 
     try:
         cooldown = monitor.AlertCooldown(monitor.ALERT_COOLDOWN_SECONDS)
@@ -155,7 +189,17 @@ def render_monitor_panel(refresh_seconds: int) -> None:
     snapshot: monitor.MarketSnapshot = result["snapshot"]
     signals: list[monitor.Signal] = result["signals"]
     push_results = result["push_results"]
+    chart_data = result.get("chart_data")
     updated_at: datetime = result["updated_at"]
+
+    st.caption(
+        f"数据源: {snapshot.data_source} · 飞书 Lark 推送 · "
+        f"自动刷新 {refresh_seconds} 秒 · "
+        f"每信号 {monitor.ALERT_COOLDOWN_SECONDS // 3600} 小时冷却 · "
+        f"静默 {monitor.quiet_hours_label()}"
+    )
+    if monitor.is_quiet_hours():
+        st.info(f"🌙 当前为静默时段（{monitor.quiet_hours_label()}），Lark 暂不推送。")
 
     handle_push_results(push_results)
 
@@ -167,10 +211,16 @@ def render_monitor_panel(refresh_seconds: int) -> None:
 
     top = st.columns(4)
     top[0].metric("当前价格", f"¥{snapshot.price:,.2f}")
-    top[1].metric("日线 RSI", f"{snapshot.daily_rsi:.2f}")
-    top[2].metric("30日最低", f"¥{snapshot.low_30d:,.2f}")
+    top[1].metric(
+        "日线 RSI",
+        f"{snapshot.daily_rsi:.2f}",
+        monitor.rsi_zone(snapshot.daily_rsi),
+    )
+    top[2].metric("30日区间", f"¥{snapshot.low_30d:,.0f}–¥{snapshot.high_30d:,.0f}")
     top[3].metric("更新时间", updated_at.strftime("%H:%M:%S"))
 
+    render_technical_indicators(snapshot)
+    render_price_chart(chart_data)
     render_price_progress(snapshot)
     render_signal_conditions(snapshot)
     render_signals(signals, cooldown)
