@@ -130,17 +130,19 @@ ACTION_BADGE = {
     "卖出": ("sell", "🟡 卖出"),
 }
 
+SIGNAL_STYLE = {
+    "cycle_buy": ("success", "💡 4年周期 · 买点"),
+    "cycle_sell": ("warning", "📤 4年周期 · 卖点"),
+    "target_reached": ("warning", "🎉 目标达成"),
+}
+
 ADVICE_STYLE = {
     "买入": "success",
     "卖出": "warning",
     "持有": "info",
+    "等待": "secondary",
     "观望": "secondary",
     "配置": "error",
-}
-
-SIGNAL_STYLE = {
-    "extreme_oversold": ("success", "💡 极端超跌 · 低吸"),
-    "target_reached": ("warning", "🎉 目标达成"),
 }
 
 
@@ -283,6 +285,23 @@ def render_portfolio(
     )
 
 
+def render_cycle_context(cycle: monitor.CycleContext, snapshot: monitor.MarketSnapshot) -> None:
+    st.subheader("4 年周期分析")
+    st.progress(
+        cycle.position_pct / 100,
+        text=(
+            f"4年位置 {cycle.position_pct:.0f}% · {cycle.phase} · "
+            f"区间 {monitor.fmt_jpy(cycle.range_low)} – {monitor.fmt_jpy(cycle.range_high)}"
+        ),
+    )
+    cols = st.columns(4)
+    cols[0].metric("周期阶段", cycle.phase, cycle.halving_label)
+    cols[1].metric("自高点回落", f"{cycle.drawdown_pct:.0f}%", f"高点 {monitor.fmt_jpy(cycle.range_high)}")
+    cols[2].metric(f"{cycle.month}月季节", cycle.month_strength, f"月均 {cycle.month_return_pct:+.1f}%")
+    cols[3].metric("样本天数", f"{cycle.data_days} 天", cycle.month_history[:20] + "…")
+    st.caption(cycle.phase_detail)
+
+
 def render_recovery_plan(plan: monitor.RecoveryPlan) -> None:
     st.subheader("回本进度")
     st.progress(
@@ -296,7 +315,7 @@ def render_recovery_plan(plan: monitor.RecoveryPlan) -> None:
 
 
 def render_swing_plan(plan: monitor.RecoveryPlan, current_price: float) -> None:
-    st.subheader("波段买卖计划")
+    st.subheader("4 年周期买卖表")
     col_buy, col_sell = st.columns(2)
 
     with col_buy:
@@ -341,7 +360,7 @@ def render_swing_plan(plan: monitor.RecoveryPlan, current_price: float) -> None:
 def render_trade_advice(advice: list[monitor.TradeAdvice]) -> None:
     st.subheader("详细说明")
     for item in advice:
-        if item.action == "持有" and item.strength == "总览":
+        if item.action == "持有" and item.strength == "周期":
             continue
         style = ADVICE_STYLE.get(item.action, "info")
         label = f"**[{item.action}]** {item.strength} · {item.title}"
@@ -361,6 +380,8 @@ def render_price_chart(chart_data) -> None:
         return
     st.subheader("价格走势")
     st.line_chart(chart_data, height=240)
+    if "p25" in chart_data.columns:
+        st.caption("参考线：4年 25% / 75% 分位（周期低吸/高抛带）")
 
 
 def render_signals(signals: list[monitor.Signal], cooldown: monitor.AlertCooldown) -> None:
@@ -442,6 +463,7 @@ def render_monitor_panel(refresh_seconds: int) -> None:
     top[1].metric("30日区间", f"{monitor.fmt_jpy(snapshot.low_30d)} – {monitor.fmt_jpy(snapshot.high_30d)}")
 
     render_current_action(current_action, updated_at, snapshot)
+    render_cycle_context(plan.cycle, snapshot)
     render_portfolio(portfolio, snapshot, plan)
     render_recovery_plan(plan)
     render_swing_plan(plan, snapshot.price)
