@@ -448,6 +448,7 @@ def fetch_coingecko_daily(days: int = 90) -> tuple[float, pd.DataFrame]:
     df["high"] = df["close"]
     df["low"] = df["close"]
     df["volume"] = 0.0
+    df["date"] = pd.to_datetime(df["timestamp"], unit="ms")
     return price, df
 
 
@@ -528,6 +529,7 @@ def build_snapshot() -> tuple[MarketSnapshot, pd.DataFrame]:
                 "timestamp": daily["open_time"],
             }
         )
+        binance_daily["date"] = pd.to_datetime(binance_daily["timestamp"], unit="ms")
         return _snapshot_from_daily(price, binance_daily, "Binance"), binance_daily
     except requests.RequestException as exc:
         errors.append(f"Binance: {exc}")
@@ -611,19 +613,23 @@ def analyze_cycle(history: pd.DataFrame, price: float, now: datetime | None = No
     if history.empty:
         raise ValueError("历史数据为空")
 
-    lo = float(history["low"].min())
-    hi = float(history["high"].max())
+    work = history.copy()
+    if "date" not in work.columns:
+        work["date"] = pd.to_datetime(work["timestamp"], unit="ms", errors="coerce")
+
+    lo = float(work["low"].min())
+    hi = float(work["high"].max())
     span = hi - lo
     position_pct = ((price - lo) / span * 100) if span > 0 else 50.0
     drawdown_pct = ((hi - price) / hi * 100) if hi > 0 else 0.0
 
-    p25 = float(history["close"].quantile(0.25))
-    p50 = float(history["close"].quantile(0.50))
-    p75 = float(history["close"].quantile(0.75))
+    p25 = float(work["close"].quantile(0.25))
+    p50 = float(work["close"].quantile(0.50))
+    p75 = float(work["close"].quantile(0.75))
 
     halving_year, halving_label = _years_since_halving(now)
     month = now.month
-    month_strength, month_ret, month_history = _month_seasonality(history, month)
+    month_strength, month_ret, month_history = _month_seasonality(work, month)
     phase, phase_detail = _cycle_phase(position_pct, drawdown_pct, halving_year)
 
     return CycleContext(
@@ -642,7 +648,7 @@ def analyze_cycle(history: pd.DataFrame, price: float, now: datetime | None = No
         p25_price=p25,
         p50_price=p50,
         p75_price=p75,
-        data_days=len(history),
+        data_days=len(work),
     )
 
 
@@ -1108,6 +1114,7 @@ def run_monitor_cycle(
         "snapshot": snapshot,
         "daily": daily,
         "portfolio": pf,
+        "cycle": cycle,
         "recovery_plan": plan,
         "current_action": current_action,
         "advice": advice,

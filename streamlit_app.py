@@ -422,6 +422,25 @@ def handle_push_results(push_results: list[dict]) -> None:
             append_alert_log(f"静默时段（{monitor.quiet_hours_label()}），暂不推送", "info")
 
 
+def _resolve_cycle(result: dict) -> monitor.CycleContext | None:
+    cycle = result.get("cycle")
+    if cycle is not None:
+        return cycle
+    plan = result.get("recovery_plan")
+    if plan is not None:
+        cycle = getattr(plan, "cycle", None)
+        if cycle is not None:
+            return cycle
+    snapshot = result.get("snapshot")
+    daily = result.get("daily")
+    if snapshot is not None and daily is not None:
+        try:
+            return monitor.analyze_cycle(daily, snapshot.price)
+        except (ValueError, KeyError, TypeError):
+            return None
+    return None
+
+
 def render_monitor_panel(refresh_seconds: int) -> None:
     st.title("XRP/JPY · 回本波段计划")
 
@@ -436,6 +455,7 @@ def render_monitor_panel(refresh_seconds: int) -> None:
 
     snapshot: monitor.MarketSnapshot = result["snapshot"]
     plan: monitor.RecoveryPlan = result["recovery_plan"]
+    cycle = _resolve_cycle(result)
     current_action: monitor.CurrentAction = result["current_action"]
     advice: list[monitor.TradeAdvice] = result["advice"]
     signals: list[monitor.Signal] = result["signals"]
@@ -463,10 +483,14 @@ def render_monitor_panel(refresh_seconds: int) -> None:
     top[1].metric("30日区间", f"{monitor.fmt_jpy(snapshot.low_30d)} – {monitor.fmt_jpy(snapshot.high_30d)}")
 
     render_current_action(current_action, updated_at, snapshot)
-    render_cycle_context(plan.cycle, snapshot)
+    if cycle is not None:
+        render_cycle_context(cycle, snapshot)
+    else:
+        st.warning("4年周期模块未就绪，请同步更新 xrp_monitor.py 与 streamlit_app.py 后重新部署。")
     render_portfolio(portfolio, snapshot, plan)
     render_recovery_plan(plan)
-    render_swing_plan(plan, snapshot.price)
+    if cycle is not None:
+        render_swing_plan(plan, snapshot.price)
     render_trade_advice(advice)
     render_price_chart(chart_data)
     render_signals(signals, cooldown)
