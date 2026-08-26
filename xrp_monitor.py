@@ -186,6 +186,20 @@ class CycleContext:
 
 
 @dataclass(frozen=True)
+class TechnicalContext:
+    """技术指标 — 买卖操作的实际触发依据。"""
+
+    rsi: float
+    rsi_zone: str
+    buy_triggered: bool
+    buy_reason: str
+    buy_strength: float
+    sell_triggered: bool
+    sell_reason: str
+    sell_strength: float
+
+
+@dataclass(frozen=True)
 class RecoveryPlan:
     total_assets: float
     target_jpy: float
@@ -199,6 +213,7 @@ class RecoveryPlan:
     hold_only_price: float
     swing_cycle_profit: float
     cycle: CycleContext
+    technical: TechnicalContext
 
 
 @dataclass(frozen=True)
@@ -652,10 +667,81 @@ def analyze_cycle(history: pd.DataFrame, price: float, now: datetime | None = No
     )
 
 
+def rsi_zone_label(rsi: float) -> str:
+    if rsi >= RSI_OVERBOUGHT:
+        return "超买"
+    if rsi <= RSI_OVERSOLD:
+        return "超卖"
+    return "中性"
+
+
+def analyze_technicals(snapshot: MarketSnapshot) -> TechnicalContext:
+    rsi = snapshot.daily_rsi
+    zone = rsi_zone_label(rsi)
+    buy_triggered = False
+    buy_reason = f"RSI {rsi:.0f}（{zone}），未达买入条件（需 <{RSI_OVERSOLD}）"
+    buy_strength = 0.0
+    sell_triggered = False
+    sell_reason = f"RSI {rsi:.0f}（{zone}），未达卖出条件（需 ≥{RSI_OVERBOUGHT}）"
+    sell_strength = 0.0
+
+    if rsi < DAILY_RSI_EXTREME and at_30d_low(snapshot):
+        buy_triggered = True
+        buy_reason = f"RSI {rsi:.0f} 极端超跌 + 近30日低点 {fmt_jpy(snapshot.low_30d)}"
+        buy_strength = 1.0
+    elif rsi < RSI_OVERSOLD and snapshot.price <= snapshot.bb_lower * 1.02:
+        buy_triggered = True
+        buy_reason = f"RSI {rsi:.0f} 超卖 + 价格近布林带下轨 {fmt_jpy(snapshot.bb_lower)}"
+        buy_strength = 0.7
+    elif rsi < RSI_OVERSOLD:
+        buy_triggered = True
+        buy_reason = f"RSI {rsi:.0f} 进入超卖区（<{RSI_OVERSOLD}）"
+        buy_strength = 0.5
+
+    if rsi >= RSI_OVERBOUGHT and snapshot.price >= snapshot.ma20:
+        sell_triggered = True
+        sell_reason = f"RSI {rsi:.0f} 超买 + 价格高于 MA20 {fmt_jpy(snapshot.ma20)}"
+        sell_strength = 1.0
+    elif rsi >= RSI_OVERBOUGHT:
+        sell_triggered = True
+        sell_reason = f"RSI {rsi:.0f} 超买（≥{RSI_OVERBOUGHT}）"
+        sell_strength = 0.75
+    elif rsi >= 65 and snapshot.price >= snapshot.ma50 and snapshot.macd_hist < 0:
+        sell_triggered = True
+        sell_reason = f"RSI {rsi:.0f} 偏高 + MACD 转弱 + 高于 MA50"
+        sell_strength = 0.5
+
+    return TechnicalContext(
+        rsi=rsi,
+        rsi_zone=zone,
+        buy_triggered=buy_triggered,
+        buy_reason=buy_reason,
+        buy_strength=buy_strength,
+        sell_triggered=sell_triggered,
+        sell_reason=sell_reason,
+        sell_strength=sell_strength,
+    )
+
+
+def _cycle_amount_scale(cycle: CycleContext, base_strength: float) -> float:
+    """周期仅微调仓位，不单独触发买卖。"""
+    scale = base_strength
+    if cycle.phase in ("筑底区", "回调低吸区"):
+        scale = min(1.0, scale + 0.1)
+    elif cycle.phase in ("过热区", "周期顶部区"):
+        scale *= 0.6
+    if cycle.month_strength == "强":
+        scale = min(1.0, scale + 0.05)
+    elif cycle.month_strength == "弱":
+        scale *= 0.85
+    return scale
+
+
 def build_recovery_plan(
     snapshot: MarketSnapshot,
     portfolio: Portfolio,
     cycle: CycleContext,
+    technical: TechnicalContext,
 ) -> RecoveryPlan:
     p = snapshot.price
     total = portfolio.total_assets(p)
@@ -675,23 +761,29 @@ def build_recovery_plan(
     sell_steps: list[PlanStep] = []
 
     buy_levels = [
-        (cycle.range_low, "4年最低点", dca_jpy, cycle.phase),
-        (cycle.p25_price, "4年 25% 分位", dca_jpy * 0.75 if dca_jpy else 0, "周期低吸带"),
-        (cycle.p50_price, "4年 50% 分位", dca_jpy * 0.5 if dca_jpy else 0, "中位以下才买"),
+        (snapshot.low_30d, "30日低点", dca_jpy, f"RSI<{DAILY_RSI_EXTREME} 且近低点"),
+        (cycle.p25_price, "4年 25% 分位", dca_jpy * 0.75 if dca_jpy else 0, f"RSI<{RSI_OVERSOLD} 时参考"),
+        (cycle.p50_price, "4年 50% 分位", dca_jpy * 0.5 if dca_jpy else 0, f"RSI<{RSI_OVERSOLD} 时参考"),
+        (cycle.range_low, "4年最低点", dca_jpy, f"RSI<{DAILY_RSI_EXTREME} 时参考"),
     ]
+    seen_prices: set[int] = set()
     for trigger, label, amount, cond in buy_levels:
-        if amount <= 0 or trigger >= p * 1.02:
+        if amount <= 0:
             continue
+        key = int(trigger)
+        if key in seen_prices:
+            continue
+        seen_prices.add(key)
         after = portfolio.after_buy(amount, trigger)
         buy_steps.append(
             PlanStep(
-                action="买入",
+                action="参考",
                 trigger_price=trigger,
                 trigger_label=f"{label}（{cond}）",
-                amount_desc=f"投入 {fmt_jpy(amount)}",
+                amount_desc=f"若触发 · 约 {fmt_jpy(amount)}",
                 result_desc=(
-                    f"预计总资产 {fmt_jpy(after.total_assets(trigger))} · "
-                    f"距目标还差 {fmt_jpy(portfolio.target_jpy - after.total_assets(trigger))}"
+                    f"周期参考位，非立即操作 · 4年阶段 {cycle.phase} · "
+                    f"预计总资产 {fmt_jpy(after.total_assets(trigger))}"
                 ),
                 amount_jpy=amount,
                 amount_xrp=amount / trigger if trigger > 0 else 0.0,
@@ -699,26 +791,28 @@ def build_recovery_plan(
         )
 
     sell_levels = [
-        (cycle.p75_price, "4年 75% 分位", SWING_SELL_FRACTION, "周期高抛带"),
-        (cycle.range_high * 0.90, "4年高点 -10%", SWING_SELL_FRACTION, "接近顶部"),
-        (cycle.range_high, "4年最高点", SWING_SELL_FRACTION_HIGH, "周期顶部分批"),
+        (cycle.p75_price, "4年 75% 分位", SWING_SELL_FRACTION, f"RSI≥{RSI_OVERBOUGHT} 时参考"),
+        (cycle.range_high * 0.90, "4年高点 -10%", SWING_SELL_FRACTION, f"RSI≥65 时参考"),
+        (cycle.range_high, "4年最高点", SWING_SELL_FRACTION_HIGH, f"RSI≥{RSI_OVERBOUGHT} 分批"),
+        (snapshot.high_30d, "30日高点", SWING_SELL_FRACTION, f"RSI≥{RSI_OVERBOUGHT} 时参考"),
     ]
+    seen_sell: set[int] = set()
     for trigger, label, fraction, cond in sell_levels:
-        if trigger <= p:
+        key = int(trigger)
+        if key in seen_sell:
             continue
+        seen_sell.add(key)
         sell_qty = portfolio.xrp_quantity * fraction
         proceeds = sell_qty * trigger
-        after = portfolio.after_sell(sell_qty, trigger)
         sell_steps.append(
             PlanStep(
-                action="卖出",
+                action="参考",
                 trigger_price=trigger,
                 trigger_label=f"{label}（{cond}）",
-                amount_desc=f"卖出 {sell_qty:,.0f} XRP → {fmt_jpy(proceeds)}",
+                amount_desc=f"若触发 · 约卖 {sell_qty:,.0f} XRP",
                 result_desc=(
-                    f"落袋现金 {fmt_jpy(after.cash_jpy)} · "
-                    f"剩余 {after.xrp_quantity:,.0f} XRP · "
-                    f"总资产 {fmt_jpy(after.total_assets(trigger))}"
+                    f"周期参考位，非立即操作 · 4年阶段 {cycle.phase} · "
+                    f"落袋约 {fmt_jpy(proceeds)}"
                 ),
                 amount_jpy=proceeds,
                 amount_xrp=sell_qty,
@@ -741,6 +835,7 @@ def build_recovery_plan(
         hold_only_price=hold_price,
         swing_cycle_profit=swing_profit,
         cycle=cycle,
+        technical=technical,
     )
 
 
@@ -754,6 +849,7 @@ def generate_trade_advice(
     dca_jpy = plan.dca_buy_jpy
     total = plan.total_assets
     cycle = plan.cycle
+    tech = plan.technical
 
     if portfolio.target_jpy <= 0:
         advice.append(
@@ -770,86 +866,83 @@ def generate_trade_advice(
     advice.append(
         TradeAdvice(
             action="持有",
-            strength="周期",
-            title=f"{cycle.phase} · {cycle.position_pct:.0f}% 位置",
+            strength="参考",
+            title=f"4年周期 · {cycle.phase}（{cycle.position_pct:.0f}%）",
             reason=(
-                f"{cycle.halving_label} · {cycle.month}月季节{cycle.month_strength} · "
-                f"4年区间 {fmt_jpy(cycle.range_low)}–{fmt_jpy(cycle.range_high)}"
+                f"{cycle.halving_label} · {cycle.month}月{cycle.month_strength} · "
+                f"区间 {fmt_jpy(cycle.range_low)}–{fmt_jpy(cycle.range_high)}"
             ),
-            detail=(
-                f"{cycle.phase_detail}。{cycle.month_history}。"
-                f"目标 {fmt_jpy(portfolio.target_jpy)} · 当前 {fmt_jpy(total)} · "
-                f"盈亏 {fmt_jpy(portfolio.pnl(p))}（{portfolio.pnl_pct(p):+.1f}%）。"
-            ),
+            detail=f"{cycle.phase_detail} · {cycle.month_history}（仅供参考，不单独触发买卖）",
         )
     )
 
-    buy_phases = {"筑底区", "回调低吸区", "积累区"}
-    sell_phases = {"周期顶部区", "过热区", "上涨后段"}
+    advice.append(
+        TradeAdvice(
+            action="持有",
+            strength="技术",
+            title=f"RSI {tech.rsi:.0f}（{tech.rsi_zone}）· MA20 {fmt_jpy(snapshot.ma20)}",
+            reason=f"买入：{tech.buy_reason}",
+            detail=f"卖出：{tech.sell_reason}",
+        )
+    )
 
-    if cycle.phase in buy_phases and dca_jpy > 0:
-        mult = 1.0 if cycle.phase == "筑底区" else (0.75 if cycle.phase == "回调低吸区" else 0.5)
-        if cycle.month_strength == "强":
-            mult = min(1.0, mult + 0.15)
-        elif cycle.month_strength == "弱":
-            mult *= 0.7
-        amount = dca_jpy * mult
-        after = portfolio.after_buy(amount, p)
+    if tech.buy_triggered and dca_jpy > 0:
+        strength = _cycle_amount_scale(cycle, tech.buy_strength)
+        amount = dca_jpy * strength
         advice.append(
             TradeAdvice(
                 action="买入",
-                strength="周期建议" if cycle.phase != "筑底区" else "强烈建议",
-                title=f"{cycle.phase} · 分批买入",
-                reason=f"4年位置 {cycle.position_pct:.0f}%，自高点回落 {cycle.drawdown_pct:.0f}%",
+                strength="强烈建议" if tech.buy_strength >= 0.9 else "建议",
+                title="技术信号 · 执行买入",
+                reason=tech.buy_reason,
                 detail=(
                     f"建议投入 {fmt_jpy(amount)} 买入约 {amount / p:.1f} XRP。"
-                    f"下一周期买点 {fmt_jpy(cycle.p25_price)} / {fmt_jpy(cycle.range_low)}。"
+                    f"周期参考：{cycle.phase}，可挂低于现价位 "
+                    f"{fmt_jpy(cycle.p25_price)} / {fmt_jpy(cycle.range_low)}。"
                 ),
             )
         )
-    elif cycle.phase in buy_phases:
+    elif tech.buy_triggered:
         advice.append(
             TradeAdvice(
                 action="买入",
                 strength="信号",
-                title=f"{cycle.phase} · 现金不足",
-                reason="周期位置支持低吸，但当前无可用现金",
-                detail=f"关注 {fmt_jpy(cycle.p25_price)} 附近再补现金执行。",
+                title="技术达标 · 现金不足",
+                reason=tech.buy_reason,
+                detail="技术条件已满足，但当前无可用现金。",
             )
         )
 
-    if cycle.phase in sell_phases or p >= cycle.p75_price * 0.97:
-        fraction = SWING_SELL_FRACTION_HIGH if cycle.phase == "周期顶部区" else SWING_SELL_FRACTION
-        if cycle.month_strength == "弱":
-            fraction = min(0.25, fraction + 0.05)
-        sell_qty = portfolio.xrp_quantity * fraction
+    if tech.sell_triggered:
+        fraction = SWING_SELL_FRACTION * tech.sell_strength
+        sell_qty = portfolio.xrp_quantity * max(SWING_SELL_FRACTION * 0.5, fraction)
         advice.append(
             TradeAdvice(
                 action="卖出",
-                strength="周期建议",
-                title=f"{cycle.phase} · 分批卖出",
-                reason=f"4年位置 {cycle.position_pct:.0f}% · {cycle.halving_label}",
+                strength="建议" if tech.sell_strength >= 0.75 else "可考虑",
+                title="技术信号 · 分批卖出",
+                reason=tech.sell_reason,
                 detail=(
-                    f"建议卖出 {sell_qty:,.0f} XRP（{fraction*100:.0f}%）约 {fmt_jpy(sell_qty * p)}。"
-                    f"下一周期卖点 {fmt_jpy(cycle.p75_price)} / {fmt_jpy(cycle.range_high)}。"
+                    f"建议卖出约 {sell_qty:,.0f} XRP（{fmt_jpy(sell_qty * p)}）。"
+                    f"周期参考卖点 {fmt_jpy(cycle.p75_price)} / {fmt_jpy(cycle.range_high)}。"
                 ),
             )
         )
 
-    if not any(a.action in ("买入", "卖出") for a in advice[1:]):
+    if not any(a.action in ("买入", "卖出") for a in advice[2:]):
         next_buy = plan.buy_steps[0] if plan.buy_steps else None
         next_sell = plan.sell_steps[0] if plan.sell_steps else None
-        parts = [f"阶段：{cycle.phase}"]
+        parts = [tech.buy_reason]
         if next_buy:
-            parts.append(f"周期买点 {fmt_jpy(next_buy.trigger_price)}")
+            parts.append(f"周期参考买 {fmt_jpy(next_buy.trigger_price)}")
         if next_sell:
-            parts.append(f"周期卖点 {fmt_jpy(next_sell.trigger_price)}")
+            parts.append(f"周期参考卖 {fmt_jpy(next_sell.trigger_price)}")
         advice.append(
             TradeAdvice(
                 action="等待",
                 strength="当前",
-                title="周期中段 · 持有观望",
-                reason=f"{cycle.month_history} · 下一资产目标 {plan.next_milestone_label}",
+                title="技术未触发 · 持有观望",
+                reason=f"RSI {tech.rsi:.0f}（{tech.rsi_zone}）· 资产目标 {plan.next_milestone_label}",
                 detail=" · ".join(parts),
             )
         )
@@ -865,45 +958,19 @@ def build_current_action(
     p = snapshot.price
     dca_jpy = plan.dca_buy_jpy
     cycle = plan.cycle
+    tech = plan.technical
     next_buy = plan.buy_steps[0] if plan.buy_steps else None
     next_sell = plan.sell_steps[0] if plan.sell_steps else None
     nb = next_buy.trigger_price if next_buy else cycle.p25_price
     ns = next_sell.trigger_price if next_sell else cycle.p75_price
 
-    buy_phases = {"筑底区", "回调低吸区", "积累区"}
-    sell_phases = {"周期顶部区", "过热区"}
-
-    if cycle.phase in buy_phases and dca_jpy > 0:
-        mult = 1.0 if cycle.phase == "筑底区" else (0.75 if cycle.phase == "回调低吸区" else 0.5)
-        if cycle.month_strength == "强":
-            mult = min(1.0, mult + 0.15)
-        amount = dca_jpy * mult
-        return CurrentAction(
-            action="买入",
-            title=f"周期 · {cycle.phase}",
-            reason=(
-                f"4年位置 {cycle.position_pct:.0f}% · {cycle.halving_label} · "
-                f"{cycle.month}月{cycle.month_strength}"
-            ),
-            buy_jpy=amount,
-            buy_xrp=amount / p if p > 0 else 0.0,
-            sell_xrp=0.0,
-            sell_jpy=0.0,
-            next_buy_price=nb,
-            next_sell_price=ns,
-            trigger_price=p,
-        )
-
-    if cycle.phase in sell_phases or (cycle.phase == "上涨后段" and p >= cycle.p75_price * 0.97):
-        fraction = SWING_SELL_FRACTION_HIGH if cycle.phase == "周期顶部区" else SWING_SELL_FRACTION
+    if tech.sell_triggered:
+        fraction = max(SWING_SELL_FRACTION * 0.5, SWING_SELL_FRACTION * tech.sell_strength)
         sell_qty = portfolio.xrp_quantity * fraction
         return CurrentAction(
             action="卖出",
-            title=f"周期 · {cycle.phase}",
-            reason=(
-                f"4年位置 {cycle.position_pct:.0f}% · 自高点回落 {cycle.drawdown_pct:.0f}% · "
-                f"{cycle.halving_label}"
-            ),
+            title="技术信号 · 分批卖出",
+            reason=f"{tech.sell_reason} · 周期参考 {cycle.phase}",
             buy_jpy=0.0,
             buy_xrp=0.0,
             sell_xrp=sell_qty,
@@ -913,11 +980,40 @@ def build_current_action(
             trigger_price=p,
         )
 
-    wait_hint = f"{cycle.phase} · 买点 {fmt_jpy(nb)} · 卖点 {fmt_jpy(ns)}"
+    if tech.buy_triggered and dca_jpy > 0:
+        strength = _cycle_amount_scale(cycle, tech.buy_strength)
+        amount = dca_jpy * strength
+        return CurrentAction(
+            action="买入",
+            title="技术信号 · 执行买入",
+            reason=f"{tech.buy_reason} · 周期参考 {cycle.phase}",
+            buy_jpy=amount,
+            buy_xrp=amount / p if p > 0 else 0.0,
+            sell_xrp=0.0,
+            sell_jpy=0.0,
+            next_buy_price=nb,
+            next_sell_price=ns,
+            trigger_price=p,
+        )
+
+    if tech.buy_triggered:
+        return CurrentAction(
+            action="等待",
+            title="技术达标 · 现金不足",
+            reason=tech.buy_reason,
+            buy_jpy=0.0,
+            buy_xrp=0.0,
+            sell_xrp=0.0,
+            sell_jpy=0.0,
+            next_buy_price=nb,
+            next_sell_price=ns,
+            trigger_price=None,
+        )
+
     return CurrentAction(
         action="等待",
-        title="周期 · 持有观望",
-        reason=f"4年位置 {cycle.position_pct:.0f}% · {cycle.month_history}",
+        title="技术未触发 · 持有观望",
+        reason=f"RSI {tech.rsi:.0f}（{tech.rsi_zone}）· 周期 {cycle.phase} 仅供参考",
         buy_jpy=0.0,
         buy_xrp=0.0,
         sell_xrp=0.0,
@@ -936,38 +1032,39 @@ def detect_signals(
     signals: list[Signal] = []
     p = snapshot.price
     cycle = plan.cycle
+    tech = plan.technical
     action = build_current_action(snapshot, portfolio, plan)
 
     if action.action == "买入" and action.buy_jpy > 0:
-        msg = f"💡【周期买点】{cycle.phase} · 建议投入 {fmt_jpy(action.buy_jpy)}"
+        msg = f"💡【技术买点】{tech.buy_reason} · 建议 {fmt_jpy(action.buy_jpy)}"
         signals.append(
             Signal(
-                key="cycle_buy",
-                title="4年周期 · 买点",
+                key="tech_buy",
+                title="RSI 买点",
                 console_msg=msg,
                 card_template="green",
                 card_body=(
                     f"{msg}\n\n"
-                    f"**价格：** {fmt_jpy(p)} · 4年位置 {cycle.position_pct:.0f}%\n"
-                    f"**阶段：** {cycle.phase} · {cycle.halving_label}\n"
-                    f"**{cycle.month}月：** {cycle.month_history}"
+                    f"**价格：** {fmt_jpy(p)} · RSI {tech.rsi:.0f}\n"
+                    f"**周期参考：** {cycle.phase}（{cycle.position_pct:.0f}%）\n"
+                    f"**4年区间：** {fmt_jpy(cycle.range_low)} – {fmt_jpy(cycle.range_high)}"
                 ),
                 color=f"{Fore.GREEN}{Style.BRIGHT}",
             )
         )
 
     if action.action == "卖出" and action.sell_xrp > 0:
-        msg = f"📤【周期卖点】{cycle.phase} · 建议卖出 {action.sell_xrp:,.0f} XRP"
+        msg = f"📤【技术卖点】{tech.sell_reason} · 约 {action.sell_xrp:,.0f} XRP"
         signals.append(
             Signal(
-                key="cycle_sell",
-                title="4年周期 · 卖点",
+                key="tech_sell",
+                title="RSI 卖点",
                 console_msg=msg,
                 card_template="blue",
                 card_body=(
                     f"{msg}\n\n"
-                    f"**价格：** {fmt_jpy(p)} · 4年位置 {cycle.position_pct:.0f}%\n"
-                    f"**阶段：** {cycle.phase} · {cycle.halving_label}\n"
+                    f"**价格：** {fmt_jpy(p)} · RSI {tech.rsi:.0f}\n"
+                    f"**周期参考：** {cycle.phase}\n"
                     f"**回收约：** {fmt_jpy(action.sell_jpy)}"
                 ),
                 color=f"{Fore.CYAN}{Style.BRIGHT}",
@@ -1105,7 +1202,8 @@ def run_monitor_cycle(
     pf = portfolio or load_portfolio()
     snapshot, daily = build_snapshot()
     cycle = analyze_cycle(daily, snapshot.price)
-    plan = build_recovery_plan(snapshot, pf, cycle)
+    technical = analyze_technicals(snapshot)
+    plan = build_recovery_plan(snapshot, pf, cycle, technical)
     current_action = build_current_action(snapshot, pf, plan)
     advice = generate_trade_advice(snapshot, pf, plan)
     signals = detect_signals(snapshot, pf, plan)
@@ -1115,6 +1213,7 @@ def run_monitor_cycle(
         "daily": daily,
         "portfolio": pf,
         "cycle": cycle,
+        "technical": technical,
         "recovery_plan": plan,
         "current_action": current_action,
         "advice": advice,

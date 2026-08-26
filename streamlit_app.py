@@ -131,8 +131,8 @@ ACTION_BADGE = {
 }
 
 SIGNAL_STYLE = {
-    "cycle_buy": ("success", "💡 4年周期 · 买点"),
-    "cycle_sell": ("warning", "📤 4年周期 · 卖点"),
+    "tech_buy": ("success", "💡 RSI 买点"),
+    "tech_sell": ("warning", "📤 RSI 卖点"),
     "target_reached": ("warning", "🎉 目标达成"),
 }
 
@@ -286,7 +286,7 @@ def render_portfolio(
 
 
 def render_cycle_context(cycle: monitor.CycleContext, snapshot: monitor.MarketSnapshot) -> None:
-    st.subheader("4 年周期分析")
+    st.subheader("4 年周期参考（不单独触发买卖）")
     st.progress(
         cycle.position_pct / 100,
         text=(
@@ -299,7 +299,30 @@ def render_cycle_context(cycle: monitor.CycleContext, snapshot: monitor.MarketSn
     cols[1].metric("自高点回落", f"{cycle.drawdown_pct:.0f}%", f"高点 {monitor.fmt_jpy(cycle.range_high)}")
     cols[2].metric(f"{cycle.month}月季节", cycle.month_strength, f"月均 {cycle.month_return_pct:+.1f}%")
     cols[3].metric("样本天数", f"{cycle.data_days} 天", cycle.month_history[:20] + "…")
-    st.caption(cycle.phase_detail)
+    st.caption(f"{cycle.phase_detail} · 以下价位仅供挂单参考，须等 RSI 等技术信号确认后再操作")
+
+
+def render_technical_context(
+    tech: monitor.TechnicalContext,
+    snapshot: monitor.MarketSnapshot,
+) -> None:
+    st.subheader("技术指标 · 操作依据")
+    cols = st.columns(4)
+    cols[0].metric("RSI(14)", f"{tech.rsi:.0f}", tech.rsi_zone)
+    cols[1].metric("MA20", monitor.fmt_jpy(snapshot.ma20))
+    cols[2].metric("MA50", monitor.fmt_jpy(snapshot.ma50))
+    cols[3].metric(
+        "布林带",
+        f"{monitor.fmt_jpy(snapshot.bb_lower)}–{monitor.fmt_jpy(snapshot.bb_upper)}",
+    )
+    if tech.buy_triggered:
+        st.success(f"买入条件：**已满足** — {tech.buy_reason}")
+    else:
+        st.info(f"买入条件：未满足 — {tech.buy_reason}")
+    if tech.sell_triggered:
+        st.warning(f"卖出条件：**已满足** — {tech.sell_reason}")
+    else:
+        st.info(f"卖出条件：未满足 — {tech.sell_reason}")
 
 
 def render_recovery_plan(plan: monitor.RecoveryPlan) -> None:
@@ -315,52 +338,53 @@ def render_recovery_plan(plan: monitor.RecoveryPlan) -> None:
 
 
 def render_swing_plan(plan: monitor.RecoveryPlan, current_price: float) -> None:
-    st.subheader("4 年周期买卖表")
+    st.subheader("周期参考价位表（需 RSI 确认）")
+    st.caption("表中为历史统计的挂单参考位，**不等于立即买入/卖出**。")
     col_buy, col_sell = st.columns(2)
 
     with col_buy:
-        st.markdown("#### 🟢 低吸（用现金）")
+        st.markdown("#### 📋 参考低吸位")
         if plan.buy_steps:
             for step in plan.buy_steps:
-                active = current_price <= step.trigger_price * 1.02
-                marker = "👉 " if active else ""
+                near = abs(current_price - step.trigger_price) / step.trigger_price < 0.03
+                marker = "📍 " if near else ""
                 st.markdown(
                     f"""
 <div class="plan-step-card buy-step">
   <div class="plan-step-price">{marker}{monitor.fmt_jpy(step.trigger_price)} · {step.trigger_label}</div>
-  <div class="plan-step-qty">买入 {monitor.fmt_jpy(step.amount_jpy)} · {step.amount_xrp:,.1f} XRP</div>
+  <div class="plan-step-qty">{step.amount_desc} · {step.amount_xrp:,.1f} XRP</div>
   <div style="font-size:0.85rem;opacity:0.85;margin-top:0.3rem;">{step.result_desc}</div>
 </div>
                     """,
                     unsafe_allow_html=True,
                 )
         else:
-            st.caption("当前现金不足，暂无低吸计划")
+            st.caption("暂无参考低吸位")
 
     with col_sell:
-        st.markdown("#### 🟡 高抛（卖 XRP）")
+        st.markdown("#### 📋 参考高抛位")
         if plan.sell_steps:
             for step in plan.sell_steps:
-                active = current_price >= step.trigger_price * 0.98
-                marker = "👉 " if active else ""
+                near = abs(current_price - step.trigger_price) / step.trigger_price < 0.03
+                marker = "📍 " if near else ""
                 st.markdown(
                     f"""
 <div class="plan-step-card sell-step">
   <div class="plan-step-price">{marker}{monitor.fmt_jpy(step.trigger_price)} · {step.trigger_label}</div>
-  <div class="plan-step-qty">卖出 {step.amount_xrp:,.0f} XRP · {monitor.fmt_jpy(step.amount_jpy)}</div>
+  <div class="plan-step-qty">{step.amount_desc} · {monitor.fmt_jpy(step.amount_jpy)}</div>
   <div style="font-size:0.85rem;opacity:0.85;margin-top:0.3rem;">{step.result_desc}</div>
 </div>
                     """,
                     unsafe_allow_html=True,
                 )
         else:
-            st.caption("暂无高于当前价的高抛计划")
+            st.caption("暂无参考高抛位")
 
 
 def render_trade_advice(advice: list[monitor.TradeAdvice]) -> None:
     st.subheader("详细说明")
     for item in advice:
-        if item.action == "持有" and item.strength == "周期":
+        if item.action == "持有" and item.strength in ("参考", "技术", "周期"):
             continue
         style = ADVICE_STYLE.get(item.action, "info")
         label = f"**[{item.action}]** {item.strength} · {item.title}"
@@ -456,6 +480,7 @@ def render_monitor_panel(refresh_seconds: int) -> None:
     snapshot: monitor.MarketSnapshot = result["snapshot"]
     plan: monitor.RecoveryPlan = result["recovery_plan"]
     cycle = _resolve_cycle(result)
+    technical = result.get("technical") or getattr(plan, "technical", None)
     current_action: monitor.CurrentAction = result["current_action"]
     advice: list[monitor.TradeAdvice] = result["advice"]
     signals: list[monitor.Signal] = result["signals"]
@@ -483,10 +508,10 @@ def render_monitor_panel(refresh_seconds: int) -> None:
     top[1].metric("30日区间", f"{monitor.fmt_jpy(snapshot.low_30d)} – {monitor.fmt_jpy(snapshot.high_30d)}")
 
     render_current_action(current_action, updated_at, snapshot)
+    if technical is not None:
+        render_technical_context(technical, snapshot)
     if cycle is not None:
         render_cycle_context(cycle, snapshot)
-    else:
-        st.warning("4年周期模块未就绪，请同步更新 xrp_monitor.py 与 streamlit_app.py 后重新部署。")
     render_portfolio(portfolio, snapshot, plan)
     render_recovery_plan(plan)
     if cycle is not None:
