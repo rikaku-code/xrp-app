@@ -311,12 +311,10 @@ def render_technical_context(
     cols[0].metric("RSI(14)", f"{tech.rsi:.0f}", tech.rsi_zone)
     stoch_label = "金叉" if tech.stoch_golden else ("死叉" if tech.stoch_dead else "—")
     cols[1].metric("Stoch %K", f"{tech.stoch_k:.0f}", f"D={tech.stoch_d:.0f} · {stoch_label}")
-    cols[2].metric("MA20", monitor.fmt_jpy(snapshot.ma20))
-    cols[3].metric("MA50", monitor.fmt_jpy(snapshot.ma50))
-    cols[4].metric(
-        "布林带",
-        f"{monitor.fmt_jpy(snapshot.bb_lower)}–{monitor.fmt_jpy(snapshot.bb_upper)}",
-    )
+    macd_label = "上穿零轴" if tech.macd_hist_bullish else ("下穿零轴" if tech.macd_hist_bearish else "—")
+    cols[2].metric("MACD 柱", f"{tech.macd_hist:+.2f}", macd_label)
+    cols[3].metric("MA20", monitor.fmt_jpy(snapshot.ma20))
+    cols[4].metric("MA50", monitor.fmt_jpy(snapshot.ma50))
     if tech.buy_triggered:
         st.success(f"买入条件：**已满足** — {tech.buy_reason}")
     else:
@@ -328,8 +326,16 @@ def render_technical_context(
     if tech.stoch_golden or tech.stoch_dead:
         cross = "ゴールデンクロス（K上穿D）" if tech.stoch_golden else "デッドクロス（K下穿D）"
         st.caption(
-            f"Stoch：{cross} · 仅在 K<{monitor.STOCH_OVERSOLD} 买 / K>{monitor.STOCH_OVERBOUGHT} 卖时触发"
+            f"Stoch：{cross} · 仅在 K≤{monitor.STOCH_OVERSOLD} 买 / K≥{monitor.STOCH_OVERBOUGHT} 卖时触发"
         )
+    if tech.macd_hist_bullish or tech.macd_hist_bearish:
+        cross = "柱上穿零轴（強気）" if tech.macd_hist_bullish else "柱下穿零轴（弱気）"
+        st.caption(
+            f"MACD：{cross} · 仅在 RSI<{monitor.RSI_OVERSOLD} 买 / RSI≥65 卖时触发"
+        )
+    st.caption(
+        f"布林带 {monitor.fmt_jpy(snapshot.bb_lower)} – {monitor.fmt_jpy(snapshot.bb_upper)}"
+    )
 
 
 def render_recovery_plan(plan: monitor.RecoveryPlan) -> None:

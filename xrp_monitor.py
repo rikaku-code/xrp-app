@@ -65,8 +65,8 @@ RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
 STOCH_PERIOD = 14
 STOCH_SMOOTH = 3
-STOCH_OVERSOLD = 30
-STOCH_OVERBOUGHT = 70
+STOCH_OVERSOLD = 20
+STOCH_OVERBOUGHT = 80
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Tokyo")
 
 FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", "")
@@ -135,6 +135,8 @@ class MarketSnapshot:
     ma20: float
     ma50: float
     macd_hist: float
+    macd_hist_bullish: bool
+    macd_hist_bearish: bool
     bb_upper: float
     bb_lower: float
     stoch_k: float
@@ -209,6 +211,9 @@ class TechnicalContext:
     stoch_d: float
     stoch_golden: bool
     stoch_dead: bool
+    macd_hist: float
+    macd_hist_bullish: bool
+    macd_hist_bearish: bool
 
 
 @dataclass(frozen=True)
@@ -507,6 +512,10 @@ def _snapshot_from_daily(price: float, daily: pd.DataFrame, source: str) -> Mark
     d_prev, d_now = float(stoch_d_series.iloc[-2]), float(stoch_d_series.iloc[-1])
     stoch_golden = k_prev <= d_prev and k_now > d_now
     stoch_dead = k_prev >= d_prev and k_now < d_now
+    hist_series = macd_ind.macd_diff()
+    hist_prev, hist_now = float(hist_series.iloc[-2]), float(hist_series.iloc[-1])
+    macd_hist_bullish = hist_prev <= 0 and hist_now > 0
+    macd_hist_bearish = hist_prev >= 0 and hist_now < 0
 
     tail = daily.tail(LOW_LOOKBACK_DAYS)
     return MarketSnapshot(
@@ -516,7 +525,9 @@ def _snapshot_from_daily(price: float, daily: pd.DataFrame, source: str) -> Mark
         high_30d=float(tail["high"].max()),
         ma20=float(ma20_series.iloc[-1]),
         ma50=float(ma50_series.iloc[-1]),
-        macd_hist=float(macd_ind.macd_diff().iloc[-1]),
+        macd_hist=hist_now,
+        macd_hist_bullish=macd_hist_bullish,
+        macd_hist_bearish=macd_hist_bearish,
         bb_upper=float(bb_ind.bollinger_hband().iloc[-1]),
         bb_lower=float(bb_ind.bollinger_lband().iloc[-1]),
         stoch_k=k_now,
@@ -740,8 +751,8 @@ def analyze_technicals(snapshot: MarketSnapshot) -> TechnicalContext:
         sell_reason = f"RSI {rsi:.0f} 偏高 + MACD 转弱 + 高于 MA50"
         sell_strength = 0.5
 
-    # ストキャス：超卖区ゴールデンクロス / 超买区デッドクロス（RSI 辅助确认）
-    if snapshot.stoch_golden and snapshot.stoch_k < STOCH_OVERSOLD:
+    # ストキャス：K≤20 ゴールデンクロス / K≥80 デッドクロスのみ有効（RSI 辅助确认）
+    if snapshot.stoch_golden and snapshot.stoch_k <= STOCH_OVERSOLD:
         if buy_triggered:
             buy_strength = min(1.0, buy_strength + 0.15)
             buy_reason += f" + Stoch 金叉（K={snapshot.stoch_k:.0f} > D={snapshot.stoch_d:.0f}）"
@@ -749,11 +760,11 @@ def analyze_technicals(snapshot: MarketSnapshot) -> TechnicalContext:
             buy_triggered = True
             buy_reason = (
                 f"Stoch 金叉（K={snapshot.stoch_k:.0f} 上穿 D={snapshot.stoch_d:.0f}）"
-                f" + 超卖区（<{STOCH_OVERSOLD}）"
+                f" + 超卖区（≤{STOCH_OVERSOLD}）"
             )
             buy_strength = 0.55
 
-    if snapshot.stoch_dead and snapshot.stoch_k > STOCH_OVERBOUGHT:
+    if snapshot.stoch_dead and snapshot.stoch_k >= STOCH_OVERBOUGHT:
         if sell_triggered:
             sell_strength = min(1.0, sell_strength + 0.15)
             sell_reason += f" + Stoch 死叉（K={snapshot.stoch_k:.0f} < D={snapshot.stoch_d:.0f}）"
@@ -761,9 +772,30 @@ def analyze_technicals(snapshot: MarketSnapshot) -> TechnicalContext:
             sell_triggered = True
             sell_reason = (
                 f"Stoch 死叉（K={snapshot.stoch_k:.0f} 下穿 D={snapshot.stoch_d:.0f}）"
-                f" + 超买区（>{STOCH_OVERBOUGHT}）"
+                f" + 超买区（≥{STOCH_OVERBOUGHT}）"
             )
             sell_strength = 0.55
+
+    # MACD 柱：零轴上穿 / 下穿（RSI 辅助确认）
+    if snapshot.macd_hist_bullish and rsi < RSI_OVERSOLD:
+        if buy_triggered:
+            buy_strength = min(1.0, buy_strength + 0.15)
+            buy_reason += f" + MACD 柱上穿零轴（{snapshot.macd_hist:+.2f}）"
+        else:
+            buy_triggered = True
+            buy_reason = (
+                f"MACD 柱上穿零轴 + RSI {rsi:.0f} 超卖（<{RSI_OVERSOLD}）"
+            )
+            buy_strength = 0.55
+
+    if snapshot.macd_hist_bearish and rsi >= 65:
+        if sell_triggered:
+            sell_strength = min(1.0, sell_strength + 0.15)
+            sell_reason += f" + MACD 柱下穿零轴（{snapshot.macd_hist:+.2f}）"
+        else:
+            sell_triggered = True
+            sell_reason = f"MACD 柱下穿零轴 + RSI {rsi:.0f} 偏高（≥65）"
+            sell_strength = 0.5
 
     return TechnicalContext(
         rsi=rsi,
@@ -778,6 +810,9 @@ def analyze_technicals(snapshot: MarketSnapshot) -> TechnicalContext:
         stoch_d=snapshot.stoch_d,
         stoch_golden=snapshot.stoch_golden,
         stoch_dead=snapshot.stoch_dead,
+        macd_hist=snapshot.macd_hist,
+        macd_hist_bullish=snapshot.macd_hist_bullish,
+        macd_hist_bearish=snapshot.macd_hist_bearish,
     )
 
 
