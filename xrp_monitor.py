@@ -63,6 +63,10 @@ MACD_SLOW = 26
 MACD_SIGNAL = 9
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
+STOCH_PERIOD = 14
+STOCH_SMOOTH = 3
+STOCH_OVERSOLD = 30
+STOCH_OVERBOUGHT = 70
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Tokyo")
 
 FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", "")
@@ -133,6 +137,10 @@ class MarketSnapshot:
     macd_hist: float
     bb_upper: float
     bb_lower: float
+    stoch_k: float
+    stoch_d: float
+    stoch_golden: bool
+    stoch_dead: bool
     data_source: str
 
 
@@ -197,6 +205,10 @@ class TechnicalContext:
     sell_triggered: bool
     sell_reason: str
     sell_strength: float
+    stoch_k: float
+    stoch_d: float
+    stoch_golden: bool
+    stoch_dead: bool
 
 
 @dataclass(frozen=True)
@@ -482,6 +494,19 @@ def _snapshot_from_daily(price: float, daily: pd.DataFrame, source: str) -> Mark
     bb_ind = ta.volatility.BollingerBands(
         close=daily["close"], window=BB_PERIOD, window_dev=BB_STD
     )
+    stoch_ind = ta.momentum.StochasticOscillator(
+        high=daily["high"],
+        low=daily["low"],
+        close=daily["close"],
+        window=STOCH_PERIOD,
+        smooth_window=STOCH_SMOOTH,
+    )
+    stoch_k_series = stoch_ind.stoch()
+    stoch_d_series = stoch_ind.stoch_signal()
+    k_prev, k_now = float(stoch_k_series.iloc[-2]), float(stoch_k_series.iloc[-1])
+    d_prev, d_now = float(stoch_d_series.iloc[-2]), float(stoch_d_series.iloc[-1])
+    stoch_golden = k_prev <= d_prev and k_now > d_now
+    stoch_dead = k_prev >= d_prev and k_now < d_now
 
     tail = daily.tail(LOW_LOOKBACK_DAYS)
     return MarketSnapshot(
@@ -494,6 +519,10 @@ def _snapshot_from_daily(price: float, daily: pd.DataFrame, source: str) -> Mark
         macd_hist=float(macd_ind.macd_diff().iloc[-1]),
         bb_upper=float(bb_ind.bollinger_hband().iloc[-1]),
         bb_lower=float(bb_ind.bollinger_lband().iloc[-1]),
+        stoch_k=k_now,
+        stoch_d=d_now,
+        stoch_golden=stoch_golden,
+        stoch_dead=stoch_dead,
         data_source=source,
     )
 
@@ -711,6 +740,31 @@ def analyze_technicals(snapshot: MarketSnapshot) -> TechnicalContext:
         sell_reason = f"RSI {rsi:.0f} 偏高 + MACD 转弱 + 高于 MA50"
         sell_strength = 0.5
 
+    # ストキャス：超卖区ゴールデンクロス / 超买区デッドクロス（RSI 辅助确认）
+    if snapshot.stoch_golden and snapshot.stoch_k < STOCH_OVERSOLD:
+        if buy_triggered:
+            buy_strength = min(1.0, buy_strength + 0.15)
+            buy_reason += f" + Stoch 金叉（K={snapshot.stoch_k:.0f} > D={snapshot.stoch_d:.0f}）"
+        else:
+            buy_triggered = True
+            buy_reason = (
+                f"Stoch 金叉（K={snapshot.stoch_k:.0f} 上穿 D={snapshot.stoch_d:.0f}）"
+                f" + 超卖区（<{STOCH_OVERSOLD}）"
+            )
+            buy_strength = 0.55
+
+    if snapshot.stoch_dead and snapshot.stoch_k > STOCH_OVERBOUGHT:
+        if sell_triggered:
+            sell_strength = min(1.0, sell_strength + 0.15)
+            sell_reason += f" + Stoch 死叉（K={snapshot.stoch_k:.0f} < D={snapshot.stoch_d:.0f}）"
+        else:
+            sell_triggered = True
+            sell_reason = (
+                f"Stoch 死叉（K={snapshot.stoch_k:.0f} 下穿 D={snapshot.stoch_d:.0f}）"
+                f" + 超买区（>{STOCH_OVERBOUGHT}）"
+            )
+            sell_strength = 0.55
+
     return TechnicalContext(
         rsi=rsi,
         rsi_zone=zone,
@@ -720,6 +774,10 @@ def analyze_technicals(snapshot: MarketSnapshot) -> TechnicalContext:
         sell_triggered=sell_triggered,
         sell_reason=sell_reason,
         sell_strength=sell_strength,
+        stoch_k=snapshot.stoch_k,
+        stoch_d=snapshot.stoch_d,
+        stoch_golden=snapshot.stoch_golden,
+        stoch_dead=snapshot.stoch_dead,
     )
 
 

@@ -307,11 +307,13 @@ def render_technical_context(
     snapshot: monitor.MarketSnapshot,
 ) -> None:
     st.subheader("技术指标 · 操作依据")
-    cols = st.columns(4)
+    cols = st.columns(5)
     cols[0].metric("RSI(14)", f"{tech.rsi:.0f}", tech.rsi_zone)
-    cols[1].metric("MA20", monitor.fmt_jpy(snapshot.ma20))
-    cols[2].metric("MA50", monitor.fmt_jpy(snapshot.ma50))
-    cols[3].metric(
+    stoch_label = "金叉" if tech.stoch_golden else ("死叉" if tech.stoch_dead else "—")
+    cols[1].metric("Stoch %K", f"{tech.stoch_k:.0f}", f"D={tech.stoch_d:.0f} · {stoch_label}")
+    cols[2].metric("MA20", monitor.fmt_jpy(snapshot.ma20))
+    cols[3].metric("MA50", monitor.fmt_jpy(snapshot.ma50))
+    cols[4].metric(
         "布林带",
         f"{monitor.fmt_jpy(snapshot.bb_lower)}–{monitor.fmt_jpy(snapshot.bb_upper)}",
     )
@@ -323,6 +325,11 @@ def render_technical_context(
         st.warning(f"卖出条件：**已满足** — {tech.sell_reason}")
     else:
         st.info(f"卖出条件：未满足 — {tech.sell_reason}")
+    if tech.stoch_golden or tech.stoch_dead:
+        cross = "ゴールデンクロス（K上穿D）" if tech.stoch_golden else "デッドクロス（K下穿D）"
+        st.caption(
+            f"Stoch：{cross} · 仅在 K<{monitor.STOCH_OVERSOLD} 买 / K>{monitor.STOCH_OVERBOUGHT} 卖时触发"
+        )
 
 
 def render_recovery_plan(plan: monitor.RecoveryPlan) -> None:
