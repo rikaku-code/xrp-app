@@ -524,6 +524,39 @@ def render_btc_section(btc: monitor.AssetTrendContext | None) -> None:
         )
 
 
+def render_action_trend_note(
+    xrp_trend: monitor.AssetTrendContext | None,
+    current_action: monitor.CurrentAction,
+    book: monitor.BookStrategyContext | None,
+) -> None:
+    """趋势判定与操作卡片不一致时说明原因。"""
+    if xrp_trend is None:
+        return
+    trend = xrp_trend.trend
+    act = current_action.action
+    if trend == "上涨" and act == "卖出":
+        st.info(
+            "📌 **趋势 vs 操作**：中长期偏多（价≥MA20、MACD>0），"
+            f"但当前触发 **{current_action.title}**（短期/风控优先）。"
+            " 趋势看方向，黄卡看此刻要不要动仓，两者可以不一致。"
+            f"\n\n触发原因：{current_action.reason}"
+        )
+    elif trend == "下跌" and act == "买入":
+        st.warning(
+            f"📌 **趋势 vs 操作**：XRP 趋势偏空，但仍出现买入信号。"
+            f" 请结合 BTC 与书本条件谨慎执行。\n\n{current_action.reason}"
+        )
+    elif act == "等待" and trend in ("上涨", "下跌"):
+        st.caption(
+            f"趋势判定为「{trend}」，但 RSI/Stoch/书本尚未同时满足操作阈值 → 暂时等待。"
+        )
+    if book and book.trailing_stop_exit and trend == "上涨":
+        st.caption(
+            "移动止损：收盘价低于实体 MA5（约 5 日短线），属于书本图 123/125 的短线离场规则，"
+            "不等于中长期趋势转空。"
+        )
+
+
 def render_xrp_section(
     snapshot: monitor.MarketSnapshot,
     xrp_trend: monitor.AssetTrendContext | None,
@@ -563,6 +596,7 @@ def render_xrp_section(
             )
 
         render_current_action(current_action, updated_at, snapshot)
+        render_action_trend_note(xrp_trend, current_action, book)
 
         if technical is not None:
             render_technical_context(technical, snapshot, book)
