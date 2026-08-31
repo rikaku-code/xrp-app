@@ -121,30 +121,30 @@ ACTION_CSS = """
     font-weight: 700;
     margin-top: 0.2rem;
 }
-.market-block {
-    border-radius: 12px;
-    padding: 1rem 1.25rem 1.1rem;
-    margin: 0.5rem 0 1rem;
-    border: 2px solid;
+.panel-banner {
+    border-left: 5px solid;
+    border-radius: 10px;
+    padding: 0.85rem 1rem;
+    margin: -0.25rem 0 1rem;
 }
-.market-block.btc {
-    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-    border-color: #f7931a;
-}
-.market-block.xrp {
-    background: linear-gradient(135deg, #0d1b2a 0%, #1b263b 100%);
-    border-color: #5eb3ff;
-}
-.block-title {
-    font-size: 1.35rem;
+.panel-banner-title {
+    font-size: 1.28rem;
     font-weight: 800;
-    margin: 0 0 0.35rem;
+    line-height: 1.25;
     letter-spacing: 0.02em;
 }
-.block-subtitle {
+.panel-banner-sub {
     font-size: 0.88rem;
     opacity: 0.82;
-    margin-bottom: 0.85rem;
+    margin-top: 0.35rem;
+    line-height: 1.45;
+}
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    border-radius: 14px !important;
+    padding: 1rem 1.15rem 1.1rem !important;
+    margin-bottom: 1.35rem !important;
+    background: rgba(255, 255, 255, 0.02) !important;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.22) !important;
 }
 </style>
 """
@@ -452,61 +452,105 @@ def render_technical_context(
     )
 
 
+def _panel_banner(title: str, subtitle: str, accent: str) -> None:
+    st.markdown(
+        f"""
+<div class="panel-banner" style="
+    border-left-color:{accent};
+    background:linear-gradient(90deg,{accent}30,transparent);
+">
+  <div class="panel-banner-title">{title}</div>
+  <div class="panel-banner-sub">{subtitle}</div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_btc_section(btc: monitor.AssetTrendContext | None) -> None:
-    st.markdown('<div class="market-block btc">', unsafe_allow_html=True)
-    st.markdown('<p class="block-title">① BTC/JPY 大盘预测</p>', unsafe_allow_html=True)
-    st.markdown(
-        '<p class="block-subtitle">与 XRP 相同技术分析 + 书本策略；'
-        "仅作联动参考，<b>不直接下单、不推送 Lark</b>。</p>",
-        unsafe_allow_html=True,
-    )
+    with st.container(border=True):
+        _panel_banner(
+            "🟠 ① BTC/JPY 大盘预测",
+            "与 XRP 相同技术分析 + 书本策略 · 仅联动参考，不直接下单、不推送 Lark",
+            "#f7931a",
+        )
 
-    if btc is None:
-        st.warning("BTC 数据暂不可用，请以 XRP 自身信号为准。")
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
+        if btc is None:
+            st.warning("BTC 数据暂不可用，请以 XRP 自身信号为准。")
+            return
 
-    t = btc.technical
-    trend_icon = {"上涨": "📈", "下跌": "📉", "震荡": "↔️"}.get(btc.trend, "—")
-    cols = st.columns(4)
-    cols[0].metric("BTC 价格", monitor.fmt_jpy(btc.snapshot.price))
-    cols[1].metric("趋势判定", f"{trend_icon} {btc.trend}", f"联动系数 {btc.xrp_bias:+.2f}")
-    cols[2].metric("4年阶段", btc.cycle.phase, f"{btc.cycle.position_pct:.0f}% 位置")
-    cols[3].metric("30日区间", f"{monitor.fmt_jpy(btc.snapshot.low_30d)} – {monitor.fmt_jpy(btc.snapshot.high_30d)}")
+        t = btc.technical
+        trend_icon = {"上涨": "📈", "下跌": "📉", "震荡": "↔️"}.get(btc.trend, "—")
+        cols = st.columns(4)
+        cols[0].metric("BTC 价格", monitor.fmt_jpy(btc.snapshot.price))
+        cols[1].metric("趋势判定", f"{trend_icon} {btc.trend}", f"联动 {btc.xrp_bias:+.2f}")
+        cols[2].metric("4年阶段", btc.cycle.phase, f"{btc.cycle.position_pct:.0f}% 位置")
+        cols[3].metric(
+            "30日区间",
+            f"{monitor.fmt_jpy(btc.snapshot.low_30d)} – {monitor.fmt_jpy(btc.snapshot.high_30d)}",
+        )
 
-    if btc.trend == "上涨":
-        st.success(monitor.btc_xrp_linkage_note(btc))
-    elif btc.trend == "下跌":
-        st.warning(monitor.btc_xrp_linkage_note(btc))
-    else:
-        st.info(monitor.btc_xrp_linkage_note(btc))
-    st.caption(f"趋势依据：{btc.trend_detail}")
+        if btc.trend == "上涨":
+            st.success(monitor.btc_xrp_linkage_note(btc))
+        elif btc.trend == "下跌":
+            st.warning(monitor.btc_xrp_linkage_note(btc))
+        else:
+            st.info(monitor.btc_xrp_linkage_note(btc))
+        st.caption(f"趋势依据：{btc.trend_detail}")
 
-    render_market_technicals(
-        "BTC 技术指标",
-        t,
-        btc.snapshot,
-        btc.book,
-        book_label="BTC 书本策略（参考）",
-        book_hint="已在 BTC 上跑相同逻辑；持仓相关项（止盈/止损）因无 BTC 持仓通常不触发。",
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def render_xrp_section_header(snapshot: monitor.MarketSnapshot) -> None:
-    st.markdown('<div class="market-block xrp">', unsafe_allow_html=True)
-    st.markdown('<p class="block-title">② XRP/JPY 持仓操作</p>', unsafe_allow_html=True)
-    st.markdown(
-        '<p class="block-subtitle">你的实际持仓与买卖信号；操作卡片、Lark 推送均以此为准。</p>',
-        unsafe_allow_html=True,
-    )
-    cols = st.columns(2)
-    cols[0].metric("XRP 价格", monitor.fmt_jpy(snapshot.price))
-    cols[1].metric("30日区间", f"{monitor.fmt_jpy(snapshot.low_30d)} – {monitor.fmt_jpy(snapshot.high_30d)}")
+        render_market_technicals(
+            "BTC 技术指标",
+            t,
+            btc.snapshot,
+            btc.book,
+            book_label="BTC 书本策略（参考）",
+            book_hint="相同逻辑已计算；持仓类信号（止盈/止损）因无 BTC 持仓通常不触发。",
+        )
 
 
-def close_xrp_section() -> None:
-    st.markdown("</div>", unsafe_allow_html=True)
+def render_xrp_section(
+    snapshot: monitor.MarketSnapshot,
+    current_action: monitor.CurrentAction,
+    updated_at: datetime,
+    technical: monitor.TechnicalContext | None,
+    book: monitor.BookStrategyContext | None,
+    cycle: monitor.CycleContext | None,
+    portfolio: monitor.Portfolio,
+    plan: monitor.RecoveryPlan,
+    advice: list[monitor.TradeAdvice],
+    chart_data,
+    signals: list[monitor.Signal],
+    cooldown: monitor.AlertCooldown,
+) -> None:
+    with st.container(border=True):
+        _panel_banner(
+            "🔵 ② XRP/JPY 持仓操作",
+            "你的实际持仓与买卖信号 · 操作卡片、Lark 推送均以此为准",
+            "#5eb3ff",
+        )
+
+        cols = st.columns(2)
+        cols[0].metric("XRP 价格", monitor.fmt_jpy(snapshot.price))
+        cols[1].metric(
+            "30日区间",
+            f"{monitor.fmt_jpy(snapshot.low_30d)} – {monitor.fmt_jpy(snapshot.high_30d)}",
+        )
+
+        render_current_action(current_action, updated_at, snapshot)
+
+        if technical is not None:
+            render_technical_context(technical, snapshot, book)
+        if book is None and getattr(monitor, "analyze_book_strategies", None) is None:
+            st.caption("⚠️ XRP 书本策略未加载：请同步最新 `xrp_monitor.py`。")
+        if cycle is not None:
+            render_cycle_context(cycle, snapshot)
+        render_portfolio(portfolio, snapshot, plan)
+        render_recovery_plan(plan)
+        if cycle is not None:
+            render_swing_plan(plan, snapshot.price)
+        render_trade_advice(advice)
+        render_price_chart(chart_data)
+        render_signals(signals, cooldown)
 
 
 def render_cycle_context(cycle: monitor.CycleContext, snapshot: monitor.MarketSnapshot) -> None:
@@ -734,25 +778,21 @@ def render_monitor_panel(refresh_seconds: int) -> None:
     # ── ① BTC 大盘（上）──────────────────────────────────────
     render_btc_section(btc)
 
-    st.divider()
-
     # ── ② XRP 操作（下）──────────────────────────────────────
-    render_xrp_section_header(snapshot)
-    render_current_action(current_action, updated_at, snapshot)
-    if technical is not None:
-        render_technical_context(technical, snapshot, book)
-    if book is None and getattr(monitor, "analyze_book_strategies", None) is None:
-        st.caption("⚠️ XRP 书本策略未加载：请同步最新 `xrp_monitor.py`。")
-    if cycle is not None:
-        render_cycle_context(cycle, snapshot)
-    render_portfolio(portfolio, snapshot, plan)
-    render_recovery_plan(plan)
-    if cycle is not None:
-        render_swing_plan(plan, snapshot.price)
-    render_trade_advice(advice)
-    render_price_chart(chart_data)
-    render_signals(signals, cooldown)
-    close_xrp_section()
+    render_xrp_section(
+        snapshot,
+        current_action,
+        updated_at,
+        technical,
+        book,
+        cycle,
+        portfolio,
+        plan,
+        advice,
+        chart_data,
+        signals,
+        cooldown,
+    )
 
     with st.expander("推送记录", expanded=False):
         if st.session_state.alert_log:
