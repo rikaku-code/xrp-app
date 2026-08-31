@@ -981,6 +981,43 @@ def apply_btc_bias_to_sell(fraction: float, strength: float, btc: AssetTrendCont
     return fraction, strength
 
 
+def build_trend_context(
+    market_label: str,
+    snapshot: MarketSnapshot,
+    cycle: CycleContext,
+    technical: TechnicalContext,
+    book: BookStrategyContext,
+) -> AssetTrendContext:
+    """从已有分析结果组装趋势上下文（不重复拉取行情）。"""
+    trend, detail, bias = derive_market_trend(snapshot, technical, book)
+    return AssetTrendContext(
+        market=market_label,
+        snapshot=snapshot,
+        cycle=cycle,
+        technical=technical,
+        book=book,
+        trend=trend,
+        trend_detail=detail,
+        xrp_bias=bias,
+    )
+
+
+def xrp_trend_operation_note(
+    xrp: AssetTrendContext,
+    btc: AssetTrendContext | None = None,
+) -> str:
+    """XRP 趋势 → 操作倾向说明（含 BTC 联动）。"""
+    if xrp.trend == "上涨":
+        note = "XRP 趋势上涨 → 持有/低吸为主，分批买入信号可信度较高"
+    elif xrp.trend == "下跌":
+        note = "XRP 趋势下跌 → 宜防守，优先等超卖或书本抄底信号再动手"
+    else:
+        note = "XRP 趋势震荡 → 按 RSI / Stoch 波段，不追涨杀跌"
+    if btc is not None:
+        note += f" · {btc_xrp_linkage_note(btc)}"
+    return note
+
+
 def build_asset_analysis(
     market: MarketSpec,
     portfolio: Portfolio | None = None,
@@ -1992,6 +2029,7 @@ def run_monitor_cycle(
     cycle = analyze_cycle(daily, snapshot.price)
     technical = analyze_technicals(snapshot)
     book = analyze_book_strategies(daily, snapshot, pf, cycle)
+    xrp_trend = build_trend_context(XRP_MARKET.label, snapshot, cycle, technical, book)
     plan = build_recovery_plan(snapshot, pf, cycle, technical, book)
     current_action = build_current_action(snapshot, pf, plan, btc)
     advice = generate_trade_advice(snapshot, pf, plan, btc)
@@ -2001,6 +2039,7 @@ def run_monitor_cycle(
         "snapshot": snapshot,
         "daily": daily,
         "btc_trend": btc,
+        "xrp_trend": xrp_trend,
         "portfolio": pf,
         "cycle": cycle,
         "technical": technical,

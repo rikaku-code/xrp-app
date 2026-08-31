@@ -467,6 +467,34 @@ def _panel_banner(title: str, subtitle: str, accent: str) -> None:
     )
 
 
+def render_trend_summary(
+    ctx: monitor.AssetTrendContext,
+    *,
+    price_label: str = "价格",
+    strength_label: str = "趋势强度",
+    operation_note: str | None = None,
+) -> None:
+    """BTC / XRP 共用的趋势判定面板。"""
+    trend_icon = {"上涨": "📈", "下跌": "📉", "震荡": "↔️"}.get(ctx.trend, "—")
+    cols = st.columns(4)
+    cols[0].metric(price_label, monitor.fmt_jpy(ctx.snapshot.price))
+    cols[1].metric("趋势判定", f"{trend_icon} {ctx.trend}", f"{strength_label} {ctx.xrp_bias:+.2f}")
+    cols[2].metric("4年阶段", ctx.cycle.phase, f"{ctx.cycle.position_pct:.0f}% 位置")
+    cols[3].metric(
+        "30日区间",
+        f"{monitor.fmt_jpy(ctx.snapshot.low_30d)} – {monitor.fmt_jpy(ctx.snapshot.high_30d)}",
+    )
+
+    note = operation_note or ""
+    if ctx.trend == "上涨":
+        st.success(note or f"趋势{ctx.trend} · 偏多")
+    elif ctx.trend == "下跌":
+        st.warning(note or f"趋势{ctx.trend} · 偏空")
+    else:
+        st.info(note or f"趋势{ctx.trend} · 观望波段")
+    st.caption(f"趋势依据：{ctx.trend_detail}")
+
+
 def render_btc_section(btc: monitor.AssetTrendContext | None) -> None:
     with st.container(border=True):
         _panel_banner(
@@ -479,28 +507,16 @@ def render_btc_section(btc: monitor.AssetTrendContext | None) -> None:
             st.warning("BTC 数据暂不可用，请以 XRP 自身信号为准。")
             return
 
-        t = btc.technical
-        trend_icon = {"上涨": "📈", "下跌": "📉", "震荡": "↔️"}.get(btc.trend, "—")
-        cols = st.columns(4)
-        cols[0].metric("BTC 价格", monitor.fmt_jpy(btc.snapshot.price))
-        cols[1].metric("趋势判定", f"{trend_icon} {btc.trend}", f"联动 {btc.xrp_bias:+.2f}")
-        cols[2].metric("4年阶段", btc.cycle.phase, f"{btc.cycle.position_pct:.0f}% 位置")
-        cols[3].metric(
-            "30日区间",
-            f"{monitor.fmt_jpy(btc.snapshot.low_30d)} – {monitor.fmt_jpy(btc.snapshot.high_30d)}",
+        render_trend_summary(
+            btc,
+            price_label="BTC 价格",
+            strength_label="联动",
+            operation_note=monitor.btc_xrp_linkage_note(btc),
         )
-
-        if btc.trend == "上涨":
-            st.success(monitor.btc_xrp_linkage_note(btc))
-        elif btc.trend == "下跌":
-            st.warning(monitor.btc_xrp_linkage_note(btc))
-        else:
-            st.info(monitor.btc_xrp_linkage_note(btc))
-        st.caption(f"趋势依据：{btc.trend_detail}")
 
         render_market_technicals(
             "BTC 技术指标",
-            t,
+            btc.technical,
             btc.snapshot,
             btc.book,
             book_label="BTC 书本策略（参考）",
@@ -510,6 +526,8 @@ def render_btc_section(btc: monitor.AssetTrendContext | None) -> None:
 
 def render_xrp_section(
     snapshot: monitor.MarketSnapshot,
+    xrp_trend: monitor.AssetTrendContext | None,
+    btc_trend: monitor.AssetTrendContext | None,
     current_action: monitor.CurrentAction,
     updated_at: datetime,
     technical: monitor.TechnicalContext | None,
@@ -529,12 +547,20 @@ def render_xrp_section(
             "#5eb3ff",
         )
 
-        cols = st.columns(2)
-        cols[0].metric("XRP 价格", monitor.fmt_jpy(snapshot.price))
-        cols[1].metric(
-            "30日区间",
-            f"{monitor.fmt_jpy(snapshot.low_30d)} – {monitor.fmt_jpy(snapshot.high_30d)}",
-        )
+        if xrp_trend is not None:
+            render_trend_summary(
+                xrp_trend,
+                price_label="XRP 价格",
+                strength_label="强度",
+                operation_note=monitor.xrp_trend_operation_note(xrp_trend, btc_trend),
+            )
+        else:
+            cols = st.columns(2)
+            cols[0].metric("XRP 价格", monitor.fmt_jpy(snapshot.price))
+            cols[1].metric(
+                "30日区间",
+                f"{monitor.fmt_jpy(snapshot.low_30d)} – {monitor.fmt_jpy(snapshot.high_30d)}",
+            )
 
         render_current_action(current_action, updated_at, snapshot)
 
@@ -759,6 +785,14 @@ def render_monitor_panel(refresh_seconds: int) -> None:
     chart_data = result.get("chart_data")
     updated_at: datetime = result["updated_at"]
     btc = result.get("btc_trend")
+    xrp_trend = result.get("xrp_trend")
+    if xrp_trend is None and technical is not None and book is not None and cycle is not None:
+        try:
+            xrp_trend = monitor.build_trend_context(
+                monitor.XRP_MARKET.label, snapshot, cycle, technical, book
+            )
+        except (AttributeError, TypeError, ValueError):
+            xrp_trend = None
 
     st.caption(
         f"自动刷新 {refresh_seconds}s · 静默 {monitor.quiet_hours_label()} · "
@@ -781,6 +815,8 @@ def render_monitor_panel(refresh_seconds: int) -> None:
     # ── ② XRP 操作（下）──────────────────────────────────────
     render_xrp_section(
         snapshot,
+        xrp_trend,
+        btc,
         current_action,
         updated_at,
         technical,
