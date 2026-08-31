@@ -178,12 +178,23 @@ def init_session_state() -> None:
         st.session_state.alert_log = []
     if "toast_keys" not in st.session_state:
         st.session_state.toast_keys = set()
+    # 仅首次访问从 .env / Secrets 载入；之后以 session 为准，不被刷新覆盖
     if "holdings_xrp" not in st.session_state:
-        st.session_state.holdings_xrp = pf.xrp_quantity
+        st.session_state.holdings_xrp = float(pf.xrp_quantity)
     if "available_jpy" not in st.session_state:
-        st.session_state.available_jpy = pf.cash_jpy
+        st.session_state.available_jpy = float(pf.cash_jpy)
     if "target_jpy" not in st.session_state:
-        st.session_state.target_jpy = pf.target_jpy
+        st.session_state.target_jpy = float(pf.target_jpy)
+
+
+def sync_portfolio_state(portfolio: monitor.Portfolio) -> None:
+    st.session_state.holdings_xrp = float(portfolio.xrp_quantity)
+    st.session_state.available_jpy = float(portfolio.cash_jpy)
+    st.session_state.target_jpy = float(portfolio.target_jpy)
+
+
+def reset_portfolio_from_config() -> None:
+    sync_portfolio_state(monitor.load_portfolio())
 
 
 def get_portfolio() -> monitor.Portfolio:
@@ -273,23 +284,81 @@ def render_current_action(
     )
 
 
-def render_portfolio(
+def render_portfolio_inputs() -> monitor.Portfolio:
+    """资产编辑区 — 放在监控计算之前，确保计划与概况使用最新持仓。"""
+    st.subheader("资产概况")
+    st.caption("可直接修改下方数字；执行买卖后点「已执行」同步持仓。")
+    edit_cols = st.columns(3)
+    edit_cols[0].number_input(
+        "XRP 持仓（枚）",
+        min_value=0.0,
+        step=1.0,
+        format="%.0f",
+        key="holdings_xrp",
+    )
+    edit_cols[1].number_input(
+        "日元现金",
+        min_value=0.0,
+        step=1000.0,
+        format="%.0f",
+        key="available_jpy",
+        help="可用于买入 XRP 的现金",
+    )
+    edit_cols[2].number_input(
+        "回本目标（日元）",
+        min_value=0.0,
+        step=10000.0,
+        format="%.0f",
+        key="target_jpy",
+        help="原始投入总额",
+    )
+    return get_portfolio()
+
+
+def render_portfolio_summary(
     portfolio: monitor.Portfolio,
     snapshot: monitor.MarketSnapshot,
-    plan: monitor.RecoveryPlan,
+    current_action: monitor.CurrentAction | None = None,
 ) -> None:
-    st.subheader("资产概况")
     pnl = portfolio.pnl(snapshot.price)
     cols = st.columns(4)
-    cols[0].metric("XRP 持仓", f"{portfolio.xrp_quantity:,.0f} 枚", monitor.fmt_jpy(portfolio.xrp_value(snapshot.price)))
-    cols[1].metric("日元现金", monitor.fmt_jpy(portfolio.cash_jpy))
-    cols[2].metric("总资产", monitor.fmt_jpy(plan.total_assets), f"目标 {monitor.fmt_jpy(portfolio.target_jpy)}")
+    cols[0].metric("XRP 市值", monitor.fmt_jpy(portfolio.xrp_value(snapshot.price)))
+    cols[1].metric("单次低吸建议", monitor.fmt_jpy(monitor.suggest_dca_jpy(portfolio.cash_jpy)), "现金 1/3")
+    cols[2].metric("总资产", monitor.fmt_jpy(portfolio.total_assets(snapshot.price)), f"目标 {monitor.fmt_jpy(portfolio.target_jpy)}")
     cols[3].metric(
         "总盈亏",
         monitor.fmt_jpy(pnl),
         f"{portfolio.pnl_pct(snapshot.price):+.1f}%",
         delta_color="normal" if pnl >= 0 else "inverse",
     )
+
+    if current_action is None:
+        return
+    btn_cols = st.columns(2)
+    if current_action.action == "买入" and current_action.buy_jpy > 0:
+        if btn_cols[0].button(
+            f"✅ 已执行买入 {monitor.fmt_jpy(current_action.buy_jpy)}",
+            key="apply_buy",
+            use_container_width=True,
+        ):
+            sync_portfolio_state(portfolio.after_buy(current_action.buy_jpy, snapshot.price))
+            append_alert_log(
+                f"已更新持仓：买入 {monitor.fmt_jpy(current_action.buy_jpy)} @ {monitor.fmt_jpy(snapshot.price)}",
+                "success",
+            )
+            st.rerun()
+    if current_action.action == "卖出" and current_action.sell_xrp > 0:
+        if btn_cols[1].button(
+            f"✅ 已执行卖出 {current_action.sell_xrp:,.0f} XRP",
+            key="apply_sell",
+            use_container_width=True,
+        ):
+            sync_portfolio_state(portfolio.after_sell(current_action.sell_xrp, snapshot.price))
+            append_alert_log(
+                f"已更新持仓：卖出 {current_action.sell_xrp:,.0f} XRP @ {monitor.fmt_jpy(snapshot.price)}",
+                "success",
+            )
+            st.rerun()
 
 
 def render_cycle_context(cycle: monitor.CycleContext, snapshot: monitor.MarketSnapshot) -> None:
@@ -531,7 +600,7 @@ def _resolve_book(result: dict) -> monitor.BookStrategyContext | None:
 def render_monitor_panel(refresh_seconds: int) -> None:
     st.title("XRP/JPY · 回本波段计划")
 
-    portfolio = get_portfolio()
+    portfolio = render_portfolio_inputs()
 
     try:
         cooldown = monitor.AlertCooldown(monitor.ALERT_COOLDOWN_SECONDS)
@@ -578,7 +647,7 @@ def render_monitor_panel(refresh_seconds: int) -> None:
         st.caption("⚠️ 书本策略未加载：请将 Streamlit Cloud 上的 `xrp_monitor.py` 同步至最新版本。")
     if cycle is not None:
         render_cycle_context(cycle, snapshot)
-    render_portfolio(portfolio, snapshot, plan)
+    render_portfolio_summary(portfolio, snapshot, current_action)
     render_recovery_plan(plan)
     if cycle is not None:
         render_swing_plan(plan, snapshot.price)
@@ -607,29 +676,16 @@ def main() -> None:
 
     with st.sidebar:
         st.header("我的资产")
-        st.session_state.holdings_xrp = st.number_input(
-            "XRP 数量", min_value=0.0, value=st.session_state.holdings_xrp, step=1.0, format="%.0f"
-        )
-        st.session_state.available_jpy = st.number_input(
-            "日元可支配资产",
-            min_value=0.0,
-            value=st.session_state.available_jpy,
-            step=1000.0,
-            format="%.0f",
-            help="可用于买入 XRP 的现金",
-        )
-        st.session_state.target_jpy = st.number_input(
-            "回本目标（日元）",
-            min_value=0.0,
-            value=st.session_state.target_jpy,
-            step=10000.0,
-            format="%.0f",
-            help="原始投入总额",
-        )
         pf = get_portfolio()
+        st.metric("XRP", f"{pf.xrp_quantity:,.0f} 枚")
+        st.metric("现金", monitor.fmt_jpy(pf.cash_jpy))
+        st.metric("回本目标", monitor.fmt_jpy(pf.target_jpy))
         st.caption(
             f"单次低吸建议 {monitor.fmt_jpy(monitor.suggest_dca_jpy(pf.cash_jpy))}（现金 1/3）"
         )
+        if st.button("重置为 Secrets / .env 默认值", use_container_width=True):
+            reset_portfolio_from_config()
+            st.rerun()
 
         st.divider()
         st.header("设置")
