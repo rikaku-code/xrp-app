@@ -503,6 +503,31 @@ def _resolve_cycle(result: dict) -> monitor.CycleContext | None:
     return None
 
 
+def _resolve_book(result: dict) -> monitor.BookStrategyContext | None:
+    """兼容 Cloud 上旧版 xrp_monitor（RecoveryPlan 无 book 字段）。"""
+    book = result.get("book")
+    if book is not None:
+        return book
+    plan = result.get("recovery_plan")
+    if plan is not None:
+        book = getattr(plan, "book", None)
+        if book is not None:
+            return book
+    analyze = getattr(monitor, "analyze_book_strategies", None)
+    if analyze is None:
+        return None
+    snapshot = result.get("snapshot")
+    daily = result.get("daily")
+    portfolio = result.get("portfolio")
+    cycle = _resolve_cycle(result)
+    if snapshot is None or daily is None or portfolio is None or cycle is None:
+        return None
+    try:
+        return analyze(daily, snapshot, portfolio, cycle)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
 def render_monitor_panel(refresh_seconds: int) -> None:
     st.title("XRP/JPY · 回本波段计划")
 
@@ -518,6 +543,7 @@ def render_monitor_panel(refresh_seconds: int) -> None:
     snapshot: monitor.MarketSnapshot = result["snapshot"]
     plan: monitor.RecoveryPlan = result["recovery_plan"]
     cycle = _resolve_cycle(result)
+    book = _resolve_book(result)
     technical = result.get("technical") or getattr(plan, "technical", None)
     current_action: monitor.CurrentAction = result["current_action"]
     advice: list[monitor.TradeAdvice] = result["advice"]
@@ -547,7 +573,9 @@ def render_monitor_panel(refresh_seconds: int) -> None:
 
     render_current_action(current_action, updated_at, snapshot)
     if technical is not None:
-        render_technical_context(technical, snapshot, plan.book)
+        render_technical_context(technical, snapshot, book)
+    if book is None and getattr(monitor, "analyze_book_strategies", None) is None:
+        st.caption("⚠️ 书本策略未加载：请将 Streamlit Cloud 上的 `xrp_monitor.py` 同步至最新版本。")
     if cycle is not None:
         render_cycle_context(cycle, snapshot)
     render_portfolio(portfolio, snapshot, plan)
