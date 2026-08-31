@@ -359,6 +359,29 @@ def render_sidebar_portfolio() -> None:
         st.rerun()
 
 
+def render_btc_trend(btc: monitor.AssetTrendContext | None) -> None:
+    st.subheader("BTC/JPY 大盘趋势 · XRP 联动参考")
+    if btc is None:
+        st.warning("BTC 数据暂不可用，仅以 XRP 自身信号为准。")
+        return
+    t = btc.technical
+    trend_icon = {"上涨": "📈", "下跌": "📉", "震荡": "↔️"}.get(btc.trend, "—")
+    cols = st.columns(6)
+    cols[0].metric("BTC 价格", monitor.fmt_jpy(btc.snapshot.price), btc.trend)
+    cols[1].metric("趋势", f"{trend_icon} {btc.trend}", f"联动 {btc.xrp_bias:+.2f}")
+    cols[2].metric("RSI", f"{t.rsi:.0f}", t.rsi_zone)
+    cols[3].metric("ADX", f"{btc.book.adx:.0f}", "强趋势" if btc.book.adx_strong else "弱趋势")
+    cols[4].metric("Stoch K", f"{t.stoch_k:.0f}", f"D={t.stoch_d:.0f}")
+    cols[5].metric("MACD 柱", f"{t.macd_hist:+.2f}")
+    st.caption(f"判定依据：{btc.trend_detail}")
+    if btc.trend == "上涨":
+        st.success(monitor.btc_xrp_linkage_note(btc))
+    elif btc.trend == "下跌":
+        st.warning(monitor.btc_xrp_linkage_note(btc))
+    else:
+        st.info(monitor.btc_xrp_linkage_note(btc))
+
+
 def render_cycle_context(cycle: monitor.CycleContext, snapshot: monitor.MarketSnapshot) -> None:
     st.subheader("4 年周期参考（不单独触发买卖）")
     st.progress(
@@ -489,7 +512,7 @@ def render_swing_plan(plan: monitor.RecoveryPlan, current_price: float) -> None:
 def render_trade_advice(advice: list[monitor.TradeAdvice]) -> None:
     st.subheader("详细说明")
     for item in advice:
-        if item.action == "持有" and item.strength in ("参考", "技术", "周期"):
+        if item.action == "持有" and item.strength in ("参考", "技术", "周期", "BTC", "书本"):
             continue
         style = ADVICE_STYLE.get(item.action, "info")
         label = f"**[{item.action}]** {item.strength} · {item.title}"
@@ -639,6 +662,7 @@ def render_monitor_panel(refresh_seconds: int) -> None:
     top[1].metric("30日区间", f"{monitor.fmt_jpy(snapshot.low_30d)} – {monitor.fmt_jpy(snapshot.high_30d)}")
 
     render_current_action(current_action, updated_at, snapshot)
+    render_btc_trend(result.get("btc_trend"))
     if technical is not None:
         render_technical_context(technical, snapshot, book)
     if book is None and getattr(monitor, "analyze_book_strategies", None) is None:

@@ -20,10 +20,9 @@ from colorama import Fore, Style, init
 
 # ── 交易与轮询 ──────────────────────────────────────────────
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
-BITBANK_TICKER_URL = "https://public.bitbank.cc/xrp_jpy/ticker"
-BITBANK_CANDLE_URL = "https://public.bitbank.cc/xrp_jpy/candlestick/1day/{year}"
+BITBANK_API = "https://public.bitbank.cc/{pair}"
 COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price"
-COINGECKO_CHART_URL = "https://api.coingecko.com/api/v3/coins/ripple/market_chart"
+COINGECKO_CHART_URL = "https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
 SYMBOL = "XRPJPY"
 PAIR_LABEL = "XRP/JPY"
 REQUEST_HEADERS = {"User-Agent": "xrp-monitor/1.0"}
@@ -83,6 +82,20 @@ APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Tokyo")
 
 FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", "")
 FEISHU_SECRET = os.getenv("FEISHU_SECRET", "")
+
+
+@dataclass(frozen=True)
+class MarketSpec:
+    """交易对配置 — XRP / BTC 共用同一套分析逻辑。"""
+
+    pair_slug: str
+    binance_symbol: str
+    coingecko_id: str
+    label: str
+
+
+XRP_MARKET = MarketSpec("xrp_jpy", "XRPJPY", "ripple", "XRP/JPY")
+BTC_MARKET = MarketSpec("btc_jpy", "BTCJPY", "bitcoin", "BTC/JPY")
 
 
 @dataclass(frozen=True)
@@ -249,6 +262,20 @@ class BookStrategyContext:
     target_price: float | None
     buy_alerts: tuple[str, ...]
     sell_alerts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AssetTrendContext:
+    """大盘（如 BTC）趋势 — 与 XRP 同逻辑，用于联动参考。"""
+
+    market: str
+    snapshot: MarketSnapshot
+    cycle: CycleContext
+    technical: TechnicalContext
+    book: BookStrategyContext
+    trend: str
+    trend_detail: str
+    xrp_bias: float
 
 
 @dataclass(frozen=True)
@@ -475,8 +502,10 @@ def clear_screen() -> None:
     os.system("cls" if os.name == "nt" else "clear")
 
 
-def fetch_binance_klines(interval: str, limit: int) -> pd.DataFrame:
-    params = {"symbol": SYMBOL, "interval": interval, "limit": limit}
+def fetch_binance_klines(
+    interval: str, limit: int, symbol: str | None = None
+) -> pd.DataFrame:
+    params = {"symbol": symbol or SYMBOL, "interval": interval, "limit": limit}
     response = requests.get(
         BINANCE_KLINES_URL, params=params, timeout=15, headers=REQUEST_HEADERS
     )
@@ -495,22 +524,26 @@ def fetch_binance_klines(interval: str, limit: int) -> pd.DataFrame:
     return df
 
 
-def fetch_bitbank_ticker() -> float:
-    response = requests.get(BITBANK_TICKER_URL, timeout=15, headers=REQUEST_HEADERS)
+def fetch_bitbank_ticker(market: MarketSpec = XRP_MARKET) -> float:
+    url = f"{BITBANK_API.format(pair=market.pair_slug)}/ticker"
+    response = requests.get(url, timeout=15, headers=REQUEST_HEADERS)
     response.raise_for_status()
     payload = response.json()
     if payload.get("success") != 1:
-        raise requests.RequestException("Bitbank ticker 返回失败")
+        raise requests.RequestException(f"Bitbank {market.label} ticker 返回失败")
     return float(payload["data"]["last"])
 
 
-def fetch_bitbank_history(years: int = CYCLE_YEARS) -> pd.DataFrame:
+def fetch_bitbank_history(
+    market: MarketSpec = XRP_MARKET,
+    years: int = CYCLE_YEARS,
+) -> pd.DataFrame:
     current_year = now_local().year
     start_year = current_year - years + 1
     frames: list[pd.DataFrame] = []
 
     for year in range(start_year, current_year + 1):
-        url = BITBANK_CANDLE_URL.format(year=year)
+        url = f"{BITBANK_API.format(pair=market.pair_slug)}/candlestick/1day/{year}"
         response = requests.get(url, timeout=15, headers=REQUEST_HEADERS)
         response.raise_for_status()
         payload = response.json()
@@ -525,7 +558,7 @@ def fetch_bitbank_history(years: int = CYCLE_YEARS) -> pd.DataFrame:
         frames.append(df)
 
     if not frames:
-        raise requests.RequestException("Bitbank 历史数据为空")
+        raise requests.RequestException(f"Bitbank {market.label} 历史数据为空")
 
     daily = pd.concat(frames, ignore_index=True)
     daily = daily.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
@@ -535,22 +568,26 @@ def fetch_bitbank_history(years: int = CYCLE_YEARS) -> pd.DataFrame:
     return daily
 
 
-def fetch_bitbank_daily() -> pd.DataFrame:
-    return fetch_bitbank_history(CYCLE_YEARS)
+def fetch_bitbank_daily(market: MarketSpec = XRP_MARKET) -> pd.DataFrame:
+    return fetch_bitbank_history(market, CYCLE_YEARS)
 
 
-def fetch_coingecko_daily(days: int = 90) -> tuple[float, pd.DataFrame]:
+def fetch_coingecko_daily(
+    market: MarketSpec = XRP_MARKET,
+    days: int = 90,
+) -> tuple[float, pd.DataFrame]:
     price_resp = requests.get(
         COINGECKO_PRICE_URL,
-        params={"ids": "ripple", "vs_currencies": "jpy"},
+        params={"ids": market.coingecko_id, "vs_currencies": "jpy"},
         timeout=15,
         headers=REQUEST_HEADERS,
     )
     price_resp.raise_for_status()
-    price = float(price_resp.json()["ripple"]["jpy"])
+    price = float(price_resp.json()[market.coingecko_id]["jpy"])
 
+    chart_url = COINGECKO_CHART_URL.format(coin_id=market.coingecko_id)
     chart_resp = requests.get(
-        COINGECKO_CHART_URL,
+        chart_url,
         params={"vs_currency": "jpy", "days": days, "interval": "daily"},
         timeout=15,
         headers=REQUEST_HEADERS,
@@ -559,7 +596,7 @@ def fetch_coingecko_daily(days: int = 90) -> tuple[float, pd.DataFrame]:
     chart = chart_resp.json()
     prices = chart.get("prices", [])
     if len(prices) < DAILY_RSI_PERIOD + 5:
-        raise requests.RequestException("CoinGecko 历史数据不足")
+        raise requests.RequestException(f"CoinGecko {market.label} 历史数据不足")
 
     df = pd.DataFrame(prices, columns=["timestamp", "close"])
     df["open"] = df["close"]
@@ -849,6 +886,131 @@ def analyze_book_strategies(
     )
 
 
+def derive_market_trend(
+    snapshot: MarketSnapshot,
+    technical: TechnicalContext,
+    book: BookStrategyContext,
+) -> tuple[str, str, float]:
+    """
+    与 XRP 相同指标判断趋势方向。
+    返回 (上涨/下跌/震荡, 说明, 对 XRP 的联动系数 -1~+1)。
+    """
+    reasons: list[str] = []
+    score = 0.0
+
+    if snapshot.price >= snapshot.ma20:
+        score += 1.0
+        reasons.append("价≥MA20")
+    else:
+        score -= 1.0
+        reasons.append("价<MA20")
+
+    if snapshot.ma20 >= snapshot.ma50:
+        score += 0.75
+        reasons.append("MA20≥MA50")
+    else:
+        score -= 0.75
+        reasons.append("MA20<MA50")
+
+    if technical.macd_hist > 0:
+        score += 0.5
+        reasons.append("MACD柱>0")
+    else:
+        score -= 0.5
+        reasons.append("MACD柱<0")
+
+    if technical.rsi >= 55:
+        score += 0.5
+    elif technical.rsi <= 45:
+        score -= 0.5
+
+    if book.adx_strong:
+        if technical.stoch_k > technical.stoch_d:
+            score += 0.75
+            reasons.append(f"ADX>{ADX_STRONG}多头")
+        elif technical.stoch_k < technical.stoch_d:
+            score -= 0.75
+            reasons.append(f"ADX>{ADX_STRONG}空头")
+
+    if technical.buy_triggered:
+        score += 1.0
+        reasons.append("买入信号")
+    if technical.sell_triggered:
+        score -= 1.0
+        reasons.append("卖出信号")
+
+    detail = " · ".join(reasons)
+    if score >= 1.5:
+        return "上涨", detail, min(1.0, score / 3.5)
+    if score <= -1.0:
+        return "下跌", detail, max(-1.0, score / 3.5)
+    return "震荡", detail or "方向不明", 0.0
+
+
+def btc_xrp_linkage_note(btc: AssetTrendContext | None) -> str:
+    """BTC 趋势对 XRP 操作的文字说明。"""
+    if btc is None:
+        return ""
+    if btc.trend == "上涨":
+        return f"BTC 趋势{btc.trend} → XRP 联动偏多，买入信号可信度提高"
+    if btc.trend == "下跌":
+        return f"BTC 趋势{btc.trend} → XRP 联动偏空，买入宜谨慎、卖出可优先参考"
+    return f"BTC 趋势{btc.trend} → 大盘方向不明，以 XRP 自身信号为主"
+
+
+def apply_btc_bias_to_buy(amount: float, strength: float, btc: AssetTrendContext | None) -> tuple[float, float]:
+    """BTC 上涨时略增买入力度，下跌时缩减。"""
+    if btc is None or amount <= 0:
+        return amount, strength
+    if btc.xrp_bias > 0:
+        boost = 1.0 + 0.15 * btc.xrp_bias
+        return amount * boost, min(1.0, strength + 0.1 * btc.xrp_bias)
+    if btc.xrp_bias < 0:
+        cut = 1.0 + 0.25 * btc.xrp_bias
+        return amount * max(0.5, cut), strength * max(0.6, 1.0 + 0.15 * btc.xrp_bias)
+    return amount, strength
+
+
+def apply_btc_bias_to_sell(fraction: float, strength: float, btc: AssetTrendContext | None) -> tuple[float, float]:
+    if btc is None:
+        return fraction, strength
+    if btc.trend == "下跌":
+        return min(1.0, fraction * 1.1), min(1.0, strength + 0.1)
+    if btc.trend == "上涨":
+        return fraction * 0.85, strength * 0.9
+    return fraction, strength
+
+
+def build_asset_analysis(
+    market: MarketSpec,
+    portfolio: Portfolio | None = None,
+) -> AssetTrendContext:
+    """对任意交易对跑与 XRP 相同的全套分析。"""
+    snapshot, daily = build_snapshot(market)
+    cycle = analyze_cycle(daily, snapshot.price)
+    technical = analyze_technicals(snapshot)
+    pf = portfolio or Portfolio(0.0, 0.0, 0.0)
+    book = analyze_book_strategies(daily, snapshot, pf, cycle)
+    trend, detail, bias = derive_market_trend(snapshot, technical, book)
+    return AssetTrendContext(
+        market=market.label,
+        snapshot=snapshot,
+        cycle=cycle,
+        technical=technical,
+        book=book,
+        trend=trend,
+        trend_detail=detail,
+        xrp_bias=bias,
+    )
+
+
+def build_btc_trend_context() -> AssetTrendContext | None:
+    try:
+        return build_asset_analysis(BTC_MARKET)
+    except requests.RequestException:
+        return None
+
+
 def build_chart_data(daily: pd.DataFrame, cycle: CycleContext | None = None, limit: int = 180) -> pd.DataFrame:
     work = daily.copy().tail(limit)
     work["date"] = pd.to_datetime(work["timestamp"], unit="ms", errors="coerce")
@@ -863,27 +1025,34 @@ def build_chart_data(daily: pd.DataFrame, cycle: CycleContext | None = None, lim
     return chart[["price"]]
 
 
-def build_snapshot() -> tuple[MarketSnapshot, pd.DataFrame]:
+def build_snapshot(
+    market: MarketSpec = XRP_MARKET,
+) -> tuple[MarketSnapshot, pd.DataFrame]:
     errors: list[str] = []
 
     try:
-        price = fetch_bitbank_ticker()
-        daily = fetch_bitbank_daily()
-        return _snapshot_from_daily(price, daily, "Bitbank"), daily
+        price = fetch_bitbank_ticker(market)
+        daily = fetch_bitbank_daily(market)
+        return _snapshot_from_daily(price, daily, f"Bitbank {market.label}"), daily
     except requests.RequestException as exc:
         errors.append(f"Bitbank: {exc}")
 
     try:
         price, daily = fetch_coingecko_daily(
-            days=max(LOW_LOOKBACK_DAYS + DAILY_RSI_PERIOD + 5, 90)
+            market,
+            days=max(LOW_LOOKBACK_DAYS + DAILY_RSI_PERIOD + 5, 90),
         )
-        return _snapshot_from_daily(price, daily, "CoinGecko"), daily
+        return _snapshot_from_daily(price, daily, f"CoinGecko {market.label}"), daily
     except requests.RequestException as exc:
         errors.append(f"CoinGecko: {exc}")
 
     try:
-        intraday = fetch_binance_klines("15m", 5)
-        daily = fetch_binance_klines("1d", max(LOW_LOOKBACK_DAYS + DAILY_RSI_PERIOD, 60))
+        intraday = fetch_binance_klines("15m", 5, market.binance_symbol)
+        daily = fetch_binance_klines(
+            "1d",
+            max(LOW_LOOKBACK_DAYS + DAILY_RSI_PERIOD, 60),
+            market.binance_symbol,
+        )
         price = float(intraday["close"].iloc[-1])
         binance_daily = pd.DataFrame(
             {
@@ -896,7 +1065,10 @@ def build_snapshot() -> tuple[MarketSnapshot, pd.DataFrame]:
             }
         )
         binance_daily["date"] = pd.to_datetime(binance_daily["timestamp"], unit="ms")
-        return _snapshot_from_daily(price, binance_daily, "Binance"), binance_daily
+        return (
+            _snapshot_from_daily(price, binance_daily, f"Binance {market.label}"),
+            binance_daily,
+        )
     except requests.RequestException as exc:
         errors.append(f"Binance: {exc}")
 
@@ -1249,6 +1421,7 @@ def generate_trade_advice(
     snapshot: MarketSnapshot,
     portfolio: Portfolio,
     plan: RecoveryPlan,
+    btc: AssetTrendContext | None = None,
 ) -> list[TradeAdvice]:
     advice: list[TradeAdvice] = []
     p = snapshot.price
@@ -1283,6 +1456,18 @@ def generate_trade_advice(
         )
     )
 
+    if btc is not None:
+        b = btc
+        advice.append(
+            TradeAdvice(
+                action="持有",
+                strength="BTC",
+                title=f"BTC 趋势 · {b.trend}（RSI {b.technical.rsi:.0f}）",
+                reason=b.trend_detail,
+                detail=btc_xrp_linkage_note(btc),
+            )
+        )
+
     advice.append(
         TradeAdvice(
             action="持有",
@@ -1306,13 +1491,14 @@ def generate_trade_advice(
 
     if tech.buy_triggered and dca_jpy > 0:
         strength = _cycle_amount_scale(cycle, tech.buy_strength)
-        amount = dca_jpy * strength
+        amount, strength = apply_btc_bias_to_buy(dca_jpy * strength, strength, btc)
+        btc_note = btc_xrp_linkage_note(btc)
         advice.append(
             TradeAdvice(
                 action="买入",
-                strength="强烈建议" if tech.buy_strength >= 0.9 else "建议",
+                strength="强烈建议" if strength >= 0.9 else "建议",
                 title="技术信号 · 执行买入",
-                reason=tech.buy_reason,
+                reason=tech.buy_reason + (f" · {btc_note}" if btc_note else ""),
                 detail=(
                     f"建议投入 {fmt_jpy(amount)} 买入约 {amount / p:.1f} XRP。"
                     f"周期参考：{cycle.phase}，可挂低于现价位 "
@@ -1333,13 +1519,17 @@ def generate_trade_advice(
 
     if tech.sell_triggered:
         fraction = SWING_SELL_FRACTION * tech.sell_strength
-        sell_qty = portfolio.xrp_quantity * max(SWING_SELL_FRACTION * 0.5, fraction)
+        fraction, sell_strength = apply_btc_bias_to_sell(
+            max(SWING_SELL_FRACTION * 0.5, fraction), tech.sell_strength, btc
+        )
+        sell_qty = portfolio.xrp_quantity * fraction
+        btc_note = btc_xrp_linkage_note(btc)
         advice.append(
             TradeAdvice(
                 action="卖出",
-                strength="建议" if tech.sell_strength >= 0.75 else "可考虑",
+                strength="建议" if sell_strength >= 0.75 else "可考虑",
                 title="技术信号 · 分批卖出",
-                reason=tech.sell_reason,
+                reason=tech.sell_reason + (f" · {btc_note}" if btc_note else ""),
                 detail=(
                     f"建议卖出约 {sell_qty:,.0f} XRP（{fmt_jpy(sell_qty * p)}）。"
                     f"周期参考卖点 {fmt_jpy(cycle.p75_price)} / {fmt_jpy(cycle.range_high)}。"
@@ -1372,12 +1562,14 @@ def build_current_action(
     snapshot: MarketSnapshot,
     portfolio: Portfolio,
     plan: RecoveryPlan,
+    btc: AssetTrendContext | None = None,
 ) -> CurrentAction:
     p = snapshot.price
     dca_jpy = plan.dca_buy_jpy
     cycle = plan.cycle
     tech = plan.technical
     book = plan.book
+    btc_suffix = f" · {btc_xrp_linkage_note(btc)}" if btc else ""
     next_buy = plan.buy_steps[0] if plan.buy_steps else None
     next_sell = plan.sell_steps[0] if plan.sell_steps else None
     nb = next_buy.trigger_price if next_buy else cycle.p25_price
@@ -1422,11 +1614,12 @@ def build_current_action(
 
     if tech.sell_triggered:
         fraction = max(SWING_SELL_FRACTION * 0.5, SWING_SELL_FRACTION * tech.sell_strength)
+        fraction, _ = apply_btc_bias_to_sell(fraction, tech.sell_strength, btc)
         sell_qty = portfolio.xrp_quantity * fraction
         return CurrentAction(
             action="卖出",
             title="技术信号 · 分批卖出",
-            reason=f"{tech.sell_reason} · 周期参考 {cycle.phase}",
+            reason=f"{tech.sell_reason} · 周期参考 {cycle.phase}{btc_suffix}",
             buy_jpy=0.0,
             buy_xrp=0.0,
             sell_xrp=sell_qty,
@@ -1445,6 +1638,7 @@ def build_current_action(
     )
     if book_buy and dca_jpy > 0:
         reason = " · ".join(book.buy_alerts) if book.buy_alerts else "书本策略买点"
+        amount, _ = apply_btc_bias_to_buy(dca_jpy, 0.55, btc)
         title = "书本策略 · 顺势买入"
         if book.scale_in_buy:
             title = "书本策略 · 顺势加仓 1/3"
@@ -1457,9 +1651,9 @@ def build_current_action(
         return CurrentAction(
             action="买入",
             title=title,
-            reason=reason,
-            buy_jpy=dca_jpy,
-            buy_xrp=dca_jpy / p if p > 0 else 0.0,
+            reason=f"{reason}{btc_suffix}",
+            buy_jpy=amount,
+            buy_xrp=amount / p if p > 0 else 0.0,
             sell_xrp=0.0,
             sell_jpy=0.0,
             next_buy_price=nb,
@@ -1483,11 +1677,11 @@ def build_current_action(
 
     if tech.buy_triggered and dca_jpy > 0:
         strength = _cycle_amount_scale(cycle, tech.buy_strength)
-        amount = dca_jpy * strength
+        amount, _ = apply_btc_bias_to_buy(dca_jpy * strength, strength, btc)
         return CurrentAction(
             action="买入",
             title="技术信号 · 执行买入",
-            reason=f"{tech.buy_reason} · 周期参考 {cycle.phase}",
+            reason=f"{tech.buy_reason} · 周期参考 {cycle.phase}{btc_suffix}",
             buy_jpy=amount,
             buy_xrp=amount / p if p > 0 else 0.0,
             sell_xrp=0.0,
@@ -1793,18 +1987,20 @@ def run_monitor_cycle(
 ) -> dict[str, Any]:
     cd = cooldown or AlertCooldown(ALERT_COOLDOWN_SECONDS)
     pf = portfolio or load_portfolio()
-    snapshot, daily = build_snapshot()
+    snapshot, daily = build_snapshot(XRP_MARKET)
+    btc = build_btc_trend_context()
     cycle = analyze_cycle(daily, snapshot.price)
     technical = analyze_technicals(snapshot)
     book = analyze_book_strategies(daily, snapshot, pf, cycle)
     plan = build_recovery_plan(snapshot, pf, cycle, technical, book)
-    current_action = build_current_action(snapshot, pf, plan)
-    advice = generate_trade_advice(snapshot, pf, plan)
+    current_action = build_current_action(snapshot, pf, plan, btc)
+    advice = generate_trade_advice(snapshot, pf, plan, btc)
     signals = detect_signals(snapshot, pf, plan)
     push_results = push_signals(signals, snapshot, cd)
     return {
         "snapshot": snapshot,
         "daily": daily,
+        "btc_trend": btc,
         "portfolio": pf,
         "cycle": cycle,
         "technical": technical,
