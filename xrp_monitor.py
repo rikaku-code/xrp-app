@@ -67,6 +67,18 @@ STOCH_PERIOD = 14
 STOCH_SMOOTH = 3
 STOCH_OVERSOLD = 20
 STOCH_OVERBOUGHT = 80
+# ── 书本策略（ADX / 背离 / Selling Climax 等）────────────────
+ADX_PERIOD = 14
+ADX_STRONG = 35
+VOLUME_AVG_DAYS = 20
+VOLUME_SPIKE_RATIO = 2.0
+SHADOW_RANGE_RATIO = 0.5
+DIVERGENCE_LOOKBACK = 45
+DIVERGENCE_RECENT_DAYS = 5
+PIVOT_ORDER = 3
+RESISTANCE_LOOKBACK = 20
+BODY_MA_PERIOD = 5
+TARGET_PROXIMITY = 0.02
 APP_TIMEZONE = os.getenv("APP_TIMEZONE", "Asia/Tokyo")
 
 FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", "")
@@ -217,6 +229,29 @@ class TechnicalContext:
 
 
 @dataclass(frozen=True)
+class BookStrategyContext:
+    """书本策略信号 — MACD 背离、Selling Climax、ADX+Stoch 等。"""
+
+    adx: float
+    adx_strong: bool
+    volume_ratio: float
+    long_lower_shadow: bool
+    long_upper_shadow: bool
+    macd_bullish_divergence: bool
+    selling_climax: bool
+    trend_follow_buy: bool
+    scale_in_buy: bool
+    partial_take_profit: bool
+    partial_profit_at_target: bool
+    trailing_stop_exit: bool
+    resistance_level: float
+    body_ma: float
+    target_price: float | None
+    buy_alerts: tuple[str, ...]
+    sell_alerts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RecoveryPlan:
     total_assets: float
     target_jpy: float
@@ -231,6 +266,7 @@ class RecoveryPlan:
     swing_cycle_profit: float
     cycle: CycleContext
     technical: TechnicalContext
+    book: BookStrategyContext
 
 
 @dataclass(frozen=True)
@@ -538,6 +574,231 @@ def _snapshot_from_daily(price: float, daily: pd.DataFrame, source: str) -> Mark
     )
 
 
+def _pivot_low_indices(series: pd.Series, order: int = PIVOT_ORDER) -> list[int]:
+    """局部低点索引，用于背离检测。"""
+    values = series.values
+    indices: list[int] = []
+    for i in range(order, len(values) - order):
+        window = values[i - order : i + order + 1]
+        if values[i] == min(window):
+            indices.append(i)
+    return indices
+
+
+def _candle_shadow_flags(
+    open_: float, high: float, low: float, close: float
+) -> tuple[bool, bool]:
+    """长下影 / 长上影：影线占整根 K 线幅度 ≥ SHADOW_RANGE_RATIO。"""
+    span = high - low
+    if span <= 0:
+        return False, False
+    body_bottom = min(open_, close)
+    body_top = max(open_, close)
+    lower_shadow = (body_bottom - low) / span
+    upper_shadow = (high - body_top) / span
+    return lower_shadow >= SHADOW_RANGE_RATIO, upper_shadow >= SHADOW_RANGE_RATIO
+
+
+def _detect_macd_bullish_divergence(
+    daily: pd.DataFrame, hist_series: pd.Series
+) -> bool:
+    """
+    MACD 底背离（图 111）：价格创新低，MACD 柱抬高 → 趋势反转预警。
+    比较最近两个局部低点：价低 MACD 高。
+    """
+    work = daily.tail(DIVERGENCE_LOOKBACK).reset_index(drop=True)
+    if len(work) < DIVERGENCE_LOOKBACK // 2:
+        return False
+    hist = hist_series.tail(len(work)).reset_index(drop=True)
+    pivots = _pivot_low_indices(work["low"])
+    if len(pivots) < 2:
+        return False
+    i1, i2 = pivots[-2], pivots[-1]
+    price_lower_low = float(work["low"].iloc[i2]) < float(work["low"].iloc[i1])
+    hist_higher_low = float(hist.iloc[i2]) > float(hist.iloc[i1])
+    recent = (len(work) - 1 - i2) <= DIVERGENCE_RECENT_DAYS
+    return price_lower_low and hist_higher_low and recent
+
+
+def _detect_selling_climax(daily: pd.DataFrame) -> tuple[bool, float]:
+    """
+    恐慌性抛售 Selling Climax（图 117）：
+    成交量 ≥ 均量 2 倍 + 下挫后长下影线 → 反转抄底。
+    """
+    if len(daily) < VOLUME_AVG_DAYS + 2:
+        return False, 0.0
+    row = daily.iloc[-1]
+    avg_vol = float(daily["volume"].iloc[-VOLUME_AVG_DAYS - 1 : -1].mean())
+    if avg_vol <= 0:
+        return False, 0.0
+    vol_ratio = float(row["volume"]) / avg_vol
+    long_lower, _ = _candle_shadow_flags(
+        float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+    )
+    # 当日收跌或明显下探，且放量
+    bearish = float(row["close"]) <= float(row["open"]) * 1.005
+    climax = vol_ratio >= VOLUME_SPIKE_RATIO and long_lower and bearish
+    return climax, vol_ratio
+
+
+def _compute_adx(daily: pd.DataFrame) -> float:
+    """ADX(14) — 仅主 ADX，忽略 +DI/-DI（图 113）。"""
+    if len(daily) < ADX_PERIOD + 5:
+        return 0.0
+    adx_ind = ta.trend.ADXIndicator(
+        high=daily["high"],
+        low=daily["low"],
+        close=daily["close"],
+        window=ADX_PERIOD,
+    )
+    return float(adx_ind.adx().iloc[-1])
+
+
+def _resistance_breakout(daily: pd.DataFrame) -> tuple[float, bool]:
+    """阻力位：近 RESISTANCE_LOOKBACK 日高点（不含当日），收盘价向上突破。"""
+    if len(daily) < RESISTANCE_LOOKBACK + 2:
+        return 0.0, False
+    resistance = float(daily["high"].iloc[-RESISTANCE_LOOKBACK - 1 : -1].max())
+    prev_close = float(daily["close"].iloc[-2])
+    close = float(daily["close"].iloc[-1])
+    breakout = close > resistance and prev_close <= resistance
+    return resistance, breakout
+
+
+def _body_close_ma(daily: pd.DataFrame) -> float:
+    """K 线实体中价（(开+收)/2）的短期均线 — 移动止损参考（图 123/125）。"""
+    body = (daily["open"] + daily["close"]) / 2
+    return float(body.rolling(BODY_MA_PERIOD).mean().iloc[-1])
+
+
+def _nearest_target_price(snapshot: MarketSnapshot, cycle: CycleContext) -> float | None:
+    """分批止盈目标位：30 日高点 / 4 年 75% 分位 / 区间高点。"""
+    candidates = [
+        snapshot.high_30d,
+        cycle.p75_price,
+        cycle.range_high * 0.90,
+    ]
+    valid = [c for c in candidates if c > 0 and snapshot.price >= c * (1 - TARGET_PROXIMITY)]
+    return max(valid) if valid else None
+
+
+def analyze_book_strategies(
+    daily: pd.DataFrame,
+    snapshot: MarketSnapshot,
+    portfolio: Portfolio,
+    cycle: CycleContext,
+) -> BookStrategyContext:
+    """整合书本策略：背离、Selling Climax、ADX+Stoch、顺势加仓、分批止盈、移动止损。"""
+    row = daily.iloc[-1]
+    open_ = float(row["open"])
+    high = float(row["high"])
+    low = float(row["low"])
+    close = float(row["close"])
+
+    macd_ind = ta.trend.MACD(
+        close=daily["close"],
+        window_slow=MACD_SLOW,
+        window_fast=MACD_FAST,
+        window_sign=MACD_SIGNAL,
+    )
+    hist_series = macd_ind.macd_diff()
+
+    adx = _compute_adx(daily)
+    adx_strong = adx > ADX_STRONG
+    long_lower, long_upper = _candle_shadow_flags(open_, high, low, close)
+    macd_div = _detect_macd_bullish_divergence(daily, hist_series)
+    selling_climax, vol_ratio = _detect_selling_climax(daily)
+    resistance, resistance_breakout = _resistance_breakout(daily)
+    body_ma = _body_close_ma(daily)
+    target_price = _nearest_target_price(snapshot, cycle)
+
+    # 量比（无论是否 Climax 均记录）
+    vol_ratio = 0.0
+    if len(daily) >= VOLUME_AVG_DAYS + 1:
+        avg_vol = float(daily["volume"].iloc[-VOLUME_AVG_DAYS - 1 : -1].mean())
+        if avg_vol > 0:
+            vol_ratio = float(row["volume"]) / avg_vol
+
+    buy_alerts: list[str] = []
+    sell_alerts: list[str] = []
+
+    # ADX>35 + Stoch K≤20 金叉 → 强趋势顺势追买（图 115）
+    trend_follow_buy = (
+        adx_strong and snapshot.stoch_golden and snapshot.stoch_k <= STOCH_OVERSOLD
+    )
+    if trend_follow_buy:
+        buy_alerts.append(
+            f"ADX {adx:.0f}>{ADX_STRONG} 强趋势 + Stoch 金叉（K={snapshot.stoch_k:.0f}≤{STOCH_OVERSOLD}）→ 顺势追买"
+        )
+
+    # 突破阻力 + Stoch 超卖区金叉 → 顺势加仓 1/3（图 115/137，拒绝逆势补仓）
+    scale_in_buy = (
+        resistance_breakout
+        and snapshot.stoch_golden
+        and snapshot.stoch_k <= STOCH_OVERSOLD
+    )
+    if scale_in_buy:
+        buy_alerts.append(
+            f"突破阻力 {fmt_jpy(resistance)} + Stoch 金叉 → 顺势加仓 {DCA_FRACTION:.0%}"
+        )
+
+    if macd_div:
+        buy_alerts.append("MACD 底背离：价格新低但柱抬高 → 趋势反转抄底")
+
+    if selling_climax:
+        buy_alerts.append(
+            f"Selling Climax：成交量 {vol_ratio:.1f}× 均量 + 长下影 → 恐慌抛售后的反转信号"
+        )
+
+    # ADX>35 + Stoch K≥80 死叉 + 长上影 → 阶段性止盈（图 115）
+    partial_take_profit = (
+        adx_strong
+        and snapshot.stoch_dead
+        and snapshot.stoch_k >= STOCH_OVERBOUGHT
+        and long_upper
+    )
+    if partial_take_profit:
+        sell_alerts.append(
+            f"ADX {adx:.0f} 强趋势 + Stoch 死叉（K≥{STOCH_OVERBOUGHT}）+ 长上影 → 分批 1/3 止盈"
+        )
+
+    # 到达目标位 → 分批 1/3 止盈（图 123/125）
+    partial_profit_at_target = target_price is not None and portfolio.xrp_quantity > 0
+    if partial_profit_at_target and target_price is not None:
+        sell_alerts.append(
+            f"价格触及目标位 {fmt_jpy(target_price)} → 建议分批 {DCA_FRACTION:.0%} 止盈"
+        )
+
+    # 收盘价跌破实体短期均线 → 剩余持仓平仓（图 123/125 移动止损）
+    trailing_stop_exit = (
+        portfolio.xrp_quantity > 0 and close < body_ma and snapshot.price < body_ma
+    )
+    if trailing_stop_exit:
+        sell_alerts.append(
+            f"价格 {fmt_jpy(close)} 跌破实体 MA{BODY_MA_PERIOD} {fmt_jpy(body_ma)} → 剩余持仓平仓"
+        )
+
+    return BookStrategyContext(
+        adx=adx,
+        adx_strong=adx_strong,
+        volume_ratio=vol_ratio,
+        long_lower_shadow=long_lower,
+        long_upper_shadow=long_upper,
+        macd_bullish_divergence=macd_div,
+        selling_climax=selling_climax,
+        trend_follow_buy=trend_follow_buy,
+        scale_in_buy=scale_in_buy,
+        partial_take_profit=partial_take_profit,
+        partial_profit_at_target=partial_profit_at_target,
+        trailing_stop_exit=trailing_stop_exit,
+        resistance_level=resistance,
+        body_ma=body_ma,
+        target_price=target_price,
+        buy_alerts=tuple(buy_alerts),
+        sell_alerts=tuple(sell_alerts),
+    )
+
+
 def build_chart_data(daily: pd.DataFrame, cycle: CycleContext | None = None, limit: int = 180) -> pd.DataFrame:
     work = daily.copy().tail(limit)
     work["date"] = pd.to_datetime(work["timestamp"], unit="ms", errors="coerce")
@@ -835,6 +1096,7 @@ def build_recovery_plan(
     portfolio: Portfolio,
     cycle: CycleContext,
     technical: TechnicalContext,
+    book: BookStrategyContext,
 ) -> RecoveryPlan:
     p = snapshot.price
     total = portfolio.total_assets(p)
@@ -929,6 +1191,7 @@ def build_recovery_plan(
         swing_cycle_profit=swing_profit,
         cycle=cycle,
         technical=technical,
+        book=book,
     )
 
 
@@ -943,6 +1206,7 @@ def generate_trade_advice(
     total = plan.total_assets
     cycle = plan.cycle
     tech = plan.technical
+    book = plan.book
 
     if portfolio.target_jpy <= 0:
         advice.append(
@@ -978,6 +1242,17 @@ def generate_trade_advice(
             detail=f"卖出：{tech.sell_reason}",
         )
     )
+
+    if book.buy_alerts or book.sell_alerts:
+        advice.append(
+            TradeAdvice(
+                action="持有",
+                strength="书本",
+                title=f"ADX {book.adx:.0f}{' 强趋势' if book.adx_strong else ''} · 量比 {book.volume_ratio:.1f}×",
+                reason=" · ".join(book.buy_alerts) if book.buy_alerts else "无书本买点",
+                detail=" · ".join(book.sell_alerts) if book.sell_alerts else "无书本卖点",
+            )
+        )
 
     if tech.buy_triggered and dca_jpy > 0:
         strength = _cycle_amount_scale(cycle, tech.buy_strength)
@@ -1052,10 +1327,48 @@ def build_current_action(
     dca_jpy = plan.dca_buy_jpy
     cycle = plan.cycle
     tech = plan.technical
+    book = plan.book
     next_buy = plan.buy_steps[0] if plan.buy_steps else None
     next_sell = plan.sell_steps[0] if plan.sell_steps else None
     nb = next_buy.trigger_price if next_buy else cycle.p25_price
     ns = next_sell.trigger_price if next_sell else cycle.p75_price
+
+    # 移动止损：跌破实体均线 → 剩余全部平仓（图 123/125）
+    if book.trailing_stop_exit:
+        sell_qty = portfolio.xrp_quantity
+        return CurrentAction(
+            action="卖出",
+            title="书本策略 · 移动止损平仓",
+            reason=book.sell_alerts[-1] if book.sell_alerts else "跌破实体短期均线",
+            buy_jpy=0.0,
+            buy_xrp=0.0,
+            sell_xrp=sell_qty,
+            sell_jpy=sell_qty * p,
+            next_buy_price=nb,
+            next_sell_price=ns,
+            trigger_price=p,
+        )
+
+    # 分批止盈 1/3（ADX+Stoch 长上影 / 目标位）
+    if book.partial_take_profit or book.partial_profit_at_target:
+        sell_qty = portfolio.xrp_quantity * DCA_FRACTION
+        reason = (
+            book.sell_alerts[0]
+            if book.sell_alerts
+            else "书本策略 · 分批止盈"
+        )
+        return CurrentAction(
+            action="卖出",
+            title="书本策略 · 分批 1/3 止盈",
+            reason=reason,
+            buy_jpy=0.0,
+            buy_xrp=0.0,
+            sell_xrp=sell_qty,
+            sell_jpy=sell_qty * p,
+            next_buy_price=nb,
+            next_sell_price=ns,
+            trigger_price=p,
+        )
 
     if tech.sell_triggered:
         fraction = max(SWING_SELL_FRACTION * 0.5, SWING_SELL_FRACTION * tech.sell_strength)
@@ -1071,6 +1384,51 @@ def build_current_action(
             next_buy_price=nb,
             next_sell_price=ns,
             trigger_price=p,
+        )
+
+    # 书本买入：背离 / Selling Climax / ADX 追买 / 突破加仓
+    book_buy = (
+        book.macd_bullish_divergence
+        or book.selling_climax
+        or book.trend_follow_buy
+        or book.scale_in_buy
+    )
+    if book_buy and dca_jpy > 0:
+        reason = " · ".join(book.buy_alerts) if book.buy_alerts else "书本策略买点"
+        title = "书本策略 · 顺势买入"
+        if book.scale_in_buy:
+            title = "书本策略 · 顺势加仓 1/3"
+        elif book.selling_climax:
+            title = "书本策略 · Selling Climax 抄底"
+        elif book.macd_bullish_divergence:
+            title = "书本策略 · MACD 底背离"
+        elif book.trend_follow_buy:
+            title = "书本策略 · ADX 强趋势追买"
+        return CurrentAction(
+            action="买入",
+            title=title,
+            reason=reason,
+            buy_jpy=dca_jpy,
+            buy_xrp=dca_jpy / p if p > 0 else 0.0,
+            sell_xrp=0.0,
+            sell_jpy=0.0,
+            next_buy_price=nb,
+            next_sell_price=ns,
+            trigger_price=p,
+        )
+
+    if book_buy:
+        return CurrentAction(
+            action="等待",
+            title="书本信号 · 现金不足",
+            reason=" · ".join(book.buy_alerts),
+            buy_jpy=0.0,
+            buy_xrp=0.0,
+            sell_xrp=0.0,
+            sell_jpy=0.0,
+            next_buy_price=nb,
+            next_sell_price=ns,
+            trigger_price=None,
         )
 
     if tech.buy_triggered and dca_jpy > 0:
@@ -1126,6 +1484,7 @@ def detect_signals(
     p = snapshot.price
     cycle = plan.cycle
     tech = plan.technical
+    book = plan.book
     action = build_current_action(snapshot, portfolio, plan)
 
     if action.action == "买入" and action.buy_jpy > 0:
@@ -1162,6 +1521,97 @@ def detect_signals(
                 ),
                 color=f"{Fore.CYAN}{Style.BRIGHT}",
             )
+        )
+
+    # ── 书本策略 Lark 提醒 ─────────────────────────────────────
+    def _book_buy_signal(key: str, title: str, reason: str) -> None:
+        buy_jpy = suggest_dca_jpy(portfolio.cash_jpy)
+        amt = (
+            f"\n**建议投入：** {fmt_jpy(buy_jpy)}（约 {buy_jpy / p:.1f} XRP）"
+            if buy_jpy > 0
+            else "\n**提示：** 技术信号已出现，但可用现金不足"
+        )
+        msg = f"📘【{title}】{reason}"
+        signals.append(
+            Signal(
+                key=key,
+                title=title,
+                console_msg=msg,
+                card_template="green",
+                card_body=(
+                    f"{msg}{amt}\n\n"
+                    f"**价格：** {fmt_jpy(p)} · ADX {book.adx:.0f} · Stoch K={tech.stoch_k:.0f}\n"
+                    f"**MACD 柱：** {tech.macd_hist:+.2f} · 量比 {book.volume_ratio:.1f}×"
+                ),
+                color=f"{Fore.GREEN}{Style.BRIGHT}",
+            )
+        )
+
+    def _book_sell_signal(
+        key: str, title: str, reason: str, *, full_exit: bool = False
+    ) -> None:
+        if full_exit:
+            amt = f"\n**建议：** 平掉剩余 {portfolio.xrp_quantity:,.0f} XRP"
+        else:
+            sell_qty = portfolio.xrp_quantity * DCA_FRACTION
+            amt = f"\n**建议卖出：** 约 {sell_qty:,.0f} XRP（{fmt_jpy(sell_qty * p)}，分批 1/3）"
+        msg = f"📘【{title}】{reason}"
+        signals.append(
+            Signal(
+                key=key,
+                title=title,
+                console_msg=msg,
+                card_template="orange" if full_exit else "blue",
+                card_body=(
+                    f"{msg}{amt}\n\n"
+                    f"**价格：** {fmt_jpy(p)} · ADX {book.adx:.0f} · 实体 MA{BODY_MA_PERIOD} {fmt_jpy(book.body_ma)}"
+                ),
+                color=f"{Fore.YELLOW if full_exit else Fore.CYAN}{Style.BRIGHT}",
+            )
+        )
+
+    if book.macd_bullish_divergence:
+        _book_buy_signal(
+            "book_macd_divergence",
+            "MACD 底背离",
+            "价格创新低但 MACD 柱抬高 → 趋势反转抄底",
+        )
+    if book.selling_climax:
+        _book_buy_signal(
+            "book_selling_climax",
+            "Selling Climax 抄底",
+            f"成交量 {book.volume_ratio:.1f}× 均量 + 长下影线 → 恐慌抛售后的反转",
+        )
+    if book.trend_follow_buy:
+        _book_buy_signal(
+            "book_trend_follow_buy",
+            "ADX 强趋势追买",
+            f"ADX {book.adx:.0f}>{ADX_STRONG} + Stoch 金叉（K≤{STOCH_OVERSOLD}）→ 顺势追买",
+        )
+    if book.scale_in_buy:
+        _book_buy_signal(
+            "book_scale_in",
+            "顺势加仓 1/3",
+            f"突破阻力 {fmt_jpy(book.resistance_level)} + Stoch 超卖金叉 → 拒绝逆势、顺势加仓",
+        )
+    if book.partial_take_profit:
+        _book_sell_signal(
+            "book_partial_take_profit",
+            "阶段性止盈 1/3",
+            f"ADX 强趋势 + Stoch 死叉（K≥{STOCH_OVERBOUGHT}）+ 长上影",
+        )
+    if book.partial_profit_at_target and book.target_price is not None:
+        _book_sell_signal(
+            "book_target_profit",
+            "目标位分批止盈",
+            f"价格触及目标位 {fmt_jpy(book.target_price)}",
+        )
+    if book.trailing_stop_exit:
+        _book_sell_signal(
+            "book_trailing_stop",
+            "移动止损平仓",
+            f"收盘跌破实体 MA{BODY_MA_PERIOD} {fmt_jpy(book.body_ma)}",
+            full_exit=True,
         )
 
     if plan.recovery_gap <= 0:
@@ -1296,7 +1746,8 @@ def run_monitor_cycle(
     snapshot, daily = build_snapshot()
     cycle = analyze_cycle(daily, snapshot.price)
     technical = analyze_technicals(snapshot)
-    plan = build_recovery_plan(snapshot, pf, cycle, technical)
+    book = analyze_book_strategies(daily, snapshot, pf, cycle)
+    plan = build_recovery_plan(snapshot, pf, cycle, technical, book)
     current_action = build_current_action(snapshot, pf, plan)
     advice = generate_trade_advice(snapshot, pf, plan)
     signals = detect_signals(snapshot, pf, plan)
@@ -1307,6 +1758,7 @@ def run_monitor_cycle(
         "portfolio": pf,
         "cycle": cycle,
         "technical": technical,
+        "book": book,
         "recovery_plan": plan,
         "current_action": current_action,
         "advice": advice,

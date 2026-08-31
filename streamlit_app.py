@@ -134,6 +134,13 @@ SIGNAL_STYLE = {
     "tech_buy": ("success", "💡 RSI 买点"),
     "tech_sell": ("warning", "📤 RSI 卖点"),
     "target_reached": ("warning", "🎉 目标达成"),
+    "book_macd_divergence": ("success", "📘 MACD 底背离"),
+    "book_selling_climax": ("success", "📘 Selling Climax"),
+    "book_trend_follow_buy": ("success", "📘 ADX 追买"),
+    "book_scale_in": ("success", "📘 顺势加仓"),
+    "book_partial_take_profit": ("warning", "📘 阶段性止盈"),
+    "book_target_profit": ("warning", "📘 目标位止盈"),
+    "book_trailing_stop": ("warning", "📘 移动止损"),
 }
 
 ADVICE_STYLE = {
@@ -305,16 +312,27 @@ def render_cycle_context(cycle: monitor.CycleContext, snapshot: monitor.MarketSn
 def render_technical_context(
     tech: monitor.TechnicalContext,
     snapshot: monitor.MarketSnapshot,
+    book: monitor.BookStrategyContext | None = None,
 ) -> None:
     st.subheader("技术指标 · 操作依据")
-    cols = st.columns(5)
+    cols = st.columns(6)
     cols[0].metric("RSI(14)", f"{tech.rsi:.0f}", tech.rsi_zone)
     stoch_label = "金叉" if tech.stoch_golden else ("死叉" if tech.stoch_dead else "—")
     cols[1].metric("Stoch %K", f"{tech.stoch_k:.0f}", f"D={tech.stoch_d:.0f} · {stoch_label}")
     macd_label = "上穿零轴" if tech.macd_hist_bullish else ("下穿零轴" if tech.macd_hist_bearish else "—")
     cols[2].metric("MACD 柱", f"{tech.macd_hist:+.2f}", macd_label)
-    cols[3].metric("MA20", monitor.fmt_jpy(snapshot.ma20))
-    cols[4].metric("MA50", monitor.fmt_jpy(snapshot.ma50))
+    if book:
+        adx_delta = "强趋势" if book.adx_strong else "弱趋势"
+        cols[3].metric("ADX(14)", f"{book.adx:.0f}", adx_delta)
+        cols[4].metric("量比", f"{book.volume_ratio:.1f}×", "均量 20 日")
+        cols[5].metric("实体 MA5", monitor.fmt_jpy(book.body_ma))
+    else:
+        cols[3].metric("MA20", monitor.fmt_jpy(snapshot.ma20))
+        cols[4].metric("MA50", monitor.fmt_jpy(snapshot.ma50))
+        cols[5].metric(
+            "布林带",
+            f"{monitor.fmt_jpy(snapshot.bb_lower)}–{monitor.fmt_jpy(snapshot.bb_upper)}",
+        )
     if tech.buy_triggered:
         st.success(f"买入条件：**已满足** — {tech.buy_reason}")
     else:
@@ -334,8 +352,15 @@ def render_technical_context(
             f"MACD：{cross} · 仅在 RSI<{monitor.RSI_OVERSOLD} 买 / RSI≥65 卖时触发"
         )
     st.caption(
-        f"布林带 {monitor.fmt_jpy(snapshot.bb_lower)} – {monitor.fmt_jpy(snapshot.bb_upper)}"
+        f"布林带 {monitor.fmt_jpy(snapshot.bb_lower)} – {monitor.fmt_jpy(snapshot.bb_upper)} · "
+        f"MA20 {monitor.fmt_jpy(snapshot.ma20)} · MA50 {monitor.fmt_jpy(snapshot.ma50)}"
     )
+    if book and (book.buy_alerts or book.sell_alerts):
+        st.markdown("**书本策略**")
+        for msg in book.buy_alerts:
+            st.success(msg)
+        for msg in book.sell_alerts:
+            st.warning(msg)
 
 
 def render_recovery_plan(plan: monitor.RecoveryPlan) -> None:
@@ -522,7 +547,7 @@ def render_monitor_panel(refresh_seconds: int) -> None:
 
     render_current_action(current_action, updated_at, snapshot)
     if technical is not None:
-        render_technical_context(technical, snapshot)
+        render_technical_context(technical, snapshot, plan.book)
     if cycle is not None:
         render_cycle_context(cycle, snapshot)
     render_portfolio(portfolio, snapshot, plan)
