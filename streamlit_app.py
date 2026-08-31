@@ -121,6 +121,31 @@ ACTION_CSS = """
     font-weight: 700;
     margin-top: 0.2rem;
 }
+.market-block {
+    border-radius: 12px;
+    padding: 1rem 1.25rem 1.1rem;
+    margin: 0.5rem 0 1rem;
+    border: 2px solid;
+}
+.market-block.btc {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    border-color: #f7931a;
+}
+.market-block.xrp {
+    background: linear-gradient(135deg, #0d1b2a 0%, #1b263b 100%);
+    border-color: #5eb3ff;
+}
+.block-title {
+    font-size: 1.35rem;
+    font-weight: 800;
+    margin: 0 0 0.35rem;
+    letter-spacing: 0.02em;
+}
+.block-subtitle {
+    font-size: 0.88rem;
+    opacity: 0.82;
+    margin-bottom: 0.85rem;
+}
 </style>
 """
 
@@ -359,31 +384,133 @@ def render_sidebar_portfolio() -> None:
         st.rerun()
 
 
-def render_btc_trend(btc: monitor.AssetTrendContext | None) -> None:
-    st.subheader("BTC/JPY 大盘趋势 · XRP 联动参考")
+def render_market_technicals(
+    title: str,
+    tech: monitor.TechnicalContext,
+    snapshot: monitor.MarketSnapshot,
+    book: monitor.BookStrategyContext | None = None,
+    *,
+    book_label: str = "书本策略",
+    book_hint: str = "",
+) -> None:
+    st.markdown(f"#### {title}")
+    cols = st.columns(6)
+    cols[0].metric("RSI(14)", f"{tech.rsi:.0f}", tech.rsi_zone)
+    stoch_label = "金叉" if tech.stoch_golden else ("死叉" if tech.stoch_dead else "—")
+    cols[1].metric("Stoch %K", f"{tech.stoch_k:.0f}", f"D={tech.stoch_d:.0f} · {stoch_label}")
+    macd_label = "上穿零轴" if tech.macd_hist_bullish else ("下穿零轴" if tech.macd_hist_bearish else "—")
+    cols[2].metric("MACD 柱", f"{tech.macd_hist:+.2f}", macd_label)
+    if book:
+        cols[3].metric("ADX(14)", f"{book.adx:.0f}", "强趋势" if book.adx_strong else "弱趋势")
+        cols[4].metric("量比", f"{book.volume_ratio:.1f}×", "均量 20 日")
+        cols[5].metric("实体 MA5", monitor.fmt_jpy(book.body_ma))
+    else:
+        cols[3].metric("MA20", monitor.fmt_jpy(snapshot.ma20))
+        cols[4].metric("MA50", monitor.fmt_jpy(snapshot.ma50))
+        cols[5].metric("布林带", f"{monitor.fmt_jpy(snapshot.bb_lower)}–{monitor.fmt_jpy(snapshot.bb_upper)}")
+
+    sig_cols = st.columns(2)
+    if tech.buy_triggered:
+        sig_cols[0].success(f"偏多：{tech.buy_reason}")
+    else:
+        sig_cols[0].info(f"偏多：未满足 — {tech.buy_reason}")
+    if tech.sell_triggered:
+        sig_cols[1].warning(f"偏空：{tech.sell_reason}")
+    else:
+        sig_cols[1].info(f"偏空：未满足 — {tech.sell_reason}")
+
+    st.caption(
+        f"MA20 {monitor.fmt_jpy(snapshot.ma20)} · MA50 {monitor.fmt_jpy(snapshot.ma50)} · "
+        f"布林带 {monitor.fmt_jpy(snapshot.bb_lower)} – {monitor.fmt_jpy(snapshot.bb_upper)} · "
+        f"数据源 {snapshot.data_source}"
+    )
+
+    if book and (book.buy_alerts or book.sell_alerts):
+        st.markdown(f"**{book_label}**")
+        if book_hint:
+            st.caption(book_hint)
+        for msg in book.buy_alerts:
+            st.success(msg)
+        for msg in book.sell_alerts:
+            st.warning(msg)
+    elif book:
+        st.caption(f"{book_label}：暂无触发项")
+
+
+def render_technical_context(
+    tech: monitor.TechnicalContext,
+    snapshot: monitor.MarketSnapshot,
+    book: monitor.BookStrategyContext | None = None,
+) -> None:
+    render_market_technicals(
+        "技术指标 · XRP 操作依据",
+        tech,
+        snapshot,
+        book,
+        book_label="XRP 书本策略（触发 Lark / 操作卡片）",
+        book_hint="以下信号会纳入 XRP 买卖判断与推送。",
+    )
+
+
+def render_btc_section(btc: monitor.AssetTrendContext | None) -> None:
+    st.markdown('<div class="market-block btc">', unsafe_allow_html=True)
+    st.markdown('<p class="block-title">① BTC/JPY 大盘预测</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="block-subtitle">与 XRP 相同技术分析 + 书本策略；'
+        "仅作联动参考，<b>不直接下单、不推送 Lark</b>。</p>",
+        unsafe_allow_html=True,
+    )
+
     if btc is None:
-        st.warning("BTC 数据暂不可用，仅以 XRP 自身信号为准。")
+        st.warning("BTC 数据暂不可用，请以 XRP 自身信号为准。")
+        st.markdown("</div>", unsafe_allow_html=True)
         return
+
     t = btc.technical
     trend_icon = {"上涨": "📈", "下跌": "📉", "震荡": "↔️"}.get(btc.trend, "—")
-    cols = st.columns(6)
-    cols[0].metric("BTC 价格", monitor.fmt_jpy(btc.snapshot.price), btc.trend)
-    cols[1].metric("趋势", f"{trend_icon} {btc.trend}", f"联动 {btc.xrp_bias:+.2f}")
-    cols[2].metric("RSI", f"{t.rsi:.0f}", t.rsi_zone)
-    cols[3].metric("ADX", f"{btc.book.adx:.0f}", "强趋势" if btc.book.adx_strong else "弱趋势")
-    cols[4].metric("Stoch K", f"{t.stoch_k:.0f}", f"D={t.stoch_d:.0f}")
-    cols[5].metric("MACD 柱", f"{t.macd_hist:+.2f}")
-    st.caption(f"判定依据：{btc.trend_detail}")
+    cols = st.columns(4)
+    cols[0].metric("BTC 价格", monitor.fmt_jpy(btc.snapshot.price))
+    cols[1].metric("趋势判定", f"{trend_icon} {btc.trend}", f"联动系数 {btc.xrp_bias:+.2f}")
+    cols[2].metric("4年阶段", btc.cycle.phase, f"{btc.cycle.position_pct:.0f}% 位置")
+    cols[3].metric("30日区间", f"{monitor.fmt_jpy(btc.snapshot.low_30d)} – {monitor.fmt_jpy(btc.snapshot.high_30d)}")
+
     if btc.trend == "上涨":
         st.success(monitor.btc_xrp_linkage_note(btc))
     elif btc.trend == "下跌":
         st.warning(monitor.btc_xrp_linkage_note(btc))
     else:
         st.info(monitor.btc_xrp_linkage_note(btc))
+    st.caption(f"趋势依据：{btc.trend_detail}")
+
+    render_market_technicals(
+        "BTC 技术指标",
+        t,
+        btc.snapshot,
+        btc.book,
+        book_label="BTC 书本策略（参考）",
+        book_hint="已在 BTC 上跑相同逻辑；持仓相关项（止盈/止损）因无 BTC 持仓通常不触发。",
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_xrp_section_header(snapshot: monitor.MarketSnapshot) -> None:
+    st.markdown('<div class="market-block xrp">', unsafe_allow_html=True)
+    st.markdown('<p class="block-title">② XRP/JPY 持仓操作</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="block-subtitle">你的实际持仓与买卖信号；操作卡片、Lark 推送均以此为准。</p>',
+        unsafe_allow_html=True,
+    )
+    cols = st.columns(2)
+    cols[0].metric("XRP 价格", monitor.fmt_jpy(snapshot.price))
+    cols[1].metric("30日区间", f"{monitor.fmt_jpy(snapshot.low_30d)} – {monitor.fmt_jpy(snapshot.high_30d)}")
+
+
+def close_xrp_section() -> None:
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_cycle_context(cycle: monitor.CycleContext, snapshot: monitor.MarketSnapshot) -> None:
-    st.subheader("4 年周期参考（不单独触发买卖）")
+    st.markdown("#### XRP 4 年周期参考（不单独触发买卖）")
     st.progress(
         cycle.position_pct / 100,
         text=(
@@ -397,60 +524,6 @@ def render_cycle_context(cycle: monitor.CycleContext, snapshot: monitor.MarketSn
     cols[2].metric(f"{cycle.month}月季节", cycle.month_strength, f"月均 {cycle.month_return_pct:+.1f}%")
     cols[3].metric("样本天数", f"{cycle.data_days} 天", cycle.month_history[:20] + "…")
     st.caption(f"{cycle.phase_detail} · 以下价位仅供挂单参考，须等 RSI 等技术信号确认后再操作")
-
-
-def render_technical_context(
-    tech: monitor.TechnicalContext,
-    snapshot: monitor.MarketSnapshot,
-    book: monitor.BookStrategyContext | None = None,
-) -> None:
-    st.subheader("技术指标 · 操作依据")
-    cols = st.columns(6)
-    cols[0].metric("RSI(14)", f"{tech.rsi:.0f}", tech.rsi_zone)
-    stoch_label = "金叉" if tech.stoch_golden else ("死叉" if tech.stoch_dead else "—")
-    cols[1].metric("Stoch %K", f"{tech.stoch_k:.0f}", f"D={tech.stoch_d:.0f} · {stoch_label}")
-    macd_label = "上穿零轴" if tech.macd_hist_bullish else ("下穿零轴" if tech.macd_hist_bearish else "—")
-    cols[2].metric("MACD 柱", f"{tech.macd_hist:+.2f}", macd_label)
-    if book:
-        adx_delta = "强趋势" if book.adx_strong else "弱趋势"
-        cols[3].metric("ADX(14)", f"{book.adx:.0f}", adx_delta)
-        cols[4].metric("量比", f"{book.volume_ratio:.1f}×", "均量 20 日")
-        cols[5].metric("实体 MA5", monitor.fmt_jpy(book.body_ma))
-    else:
-        cols[3].metric("MA20", monitor.fmt_jpy(snapshot.ma20))
-        cols[4].metric("MA50", monitor.fmt_jpy(snapshot.ma50))
-        cols[5].metric(
-            "布林带",
-            f"{monitor.fmt_jpy(snapshot.bb_lower)}–{monitor.fmt_jpy(snapshot.bb_upper)}",
-        )
-    if tech.buy_triggered:
-        st.success(f"买入条件：**已满足** — {tech.buy_reason}")
-    else:
-        st.info(f"买入条件：未满足 — {tech.buy_reason}")
-    if tech.sell_triggered:
-        st.warning(f"卖出条件：**已满足** — {tech.sell_reason}")
-    else:
-        st.info(f"卖出条件：未满足 — {tech.sell_reason}")
-    if tech.stoch_golden or tech.stoch_dead:
-        cross = "ゴールデンクロス（K上穿D）" if tech.stoch_golden else "デッドクロス（K下穿D）"
-        st.caption(
-            f"Stoch：{cross} · 仅在 K≤{monitor.STOCH_OVERSOLD} 买 / K≥{monitor.STOCH_OVERBOUGHT} 卖时触发"
-        )
-    if tech.macd_hist_bullish or tech.macd_hist_bearish:
-        cross = "柱上穿零轴（強気）" if tech.macd_hist_bullish else "柱下穿零轴（弱気）"
-        st.caption(
-            f"MACD：{cross} · 仅在 RSI<{monitor.RSI_OVERSOLD} 买 / RSI≥65 卖时触发"
-        )
-    st.caption(
-        f"布林带 {monitor.fmt_jpy(snapshot.bb_lower)} – {monitor.fmt_jpy(snapshot.bb_upper)} · "
-        f"MA20 {monitor.fmt_jpy(snapshot.ma20)} · MA50 {monitor.fmt_jpy(snapshot.ma50)}"
-    )
-    if book and (book.buy_alerts or book.sell_alerts):
-        st.markdown("**书本策略**")
-        for msg in book.buy_alerts:
-            st.success(msg)
-        for msg in book.sell_alerts:
-            st.warning(msg)
 
 
 def render_recovery_plan(plan: monitor.RecoveryPlan) -> None:
@@ -530,7 +603,7 @@ def render_trade_advice(advice: list[monitor.TradeAdvice]) -> None:
 def render_price_chart(chart_data) -> None:
     if chart_data is None or chart_data.empty:
         return
-    st.subheader("价格走势")
+    st.markdown("#### XRP 价格走势")
     st.line_chart(chart_data, height=240)
     if "p25" in chart_data.columns:
         st.caption("参考线：4年 25% / 75% 分位（周期低吸/高抛带）")
@@ -539,7 +612,7 @@ def render_price_chart(chart_data) -> None:
 def render_signals(signals: list[monitor.Signal], cooldown: monitor.AlertCooldown) -> None:
     if not signals:
         return
-    st.subheader("Lark 推送")
+    st.markdown("#### XRP Lark 推送")
     for signal in signals:
         style, _ = SIGNAL_STYLE.get(signal.key, ("info", signal.title))
         remain = cooldown.remaining_hours(signal.key)
@@ -641,10 +714,11 @@ def render_monitor_panel(refresh_seconds: int) -> None:
     push_results = result["push_results"]
     chart_data = result.get("chart_data")
     updated_at: datetime = result["updated_at"]
+    btc = result.get("btc_trend")
 
     st.caption(
-        f"数据源: {snapshot.data_source} · RSI {snapshot.daily_rsi:.1f} · "
-        f"自动刷新 {refresh_seconds}s · 静默 {monitor.quiet_hours_label()}"
+        f"自动刷新 {refresh_seconds}s · 静默 {monitor.quiet_hours_label()} · "
+        f"XRP 数据源 {snapshot.data_source}"
     )
     if monitor.is_quiet_hours():
         st.info(f"🌙 静默时段（{monitor.quiet_hours_label()}），Lark 暂不推送。")
@@ -657,16 +731,18 @@ def render_monitor_panel(refresh_seconds: int) -> None:
             st.toast(signal.console_msg, icon="🔔")
             st.session_state.toast_keys.add(toast_key)
 
-    top = st.columns(2)
-    top[0].metric("当前价格", monitor.fmt_jpy(snapshot.price))
-    top[1].metric("30日区间", f"{monitor.fmt_jpy(snapshot.low_30d)} – {monitor.fmt_jpy(snapshot.high_30d)}")
+    # ── ① BTC 大盘（上）──────────────────────────────────────
+    render_btc_section(btc)
 
+    st.divider()
+
+    # ── ② XRP 操作（下）──────────────────────────────────────
+    render_xrp_section_header(snapshot)
     render_current_action(current_action, updated_at, snapshot)
-    render_btc_trend(result.get("btc_trend"))
     if technical is not None:
         render_technical_context(technical, snapshot, book)
     if book is None and getattr(monitor, "analyze_book_strategies", None) is None:
-        st.caption("⚠️ 书本策略未加载：请将 Streamlit Cloud 上的 `xrp_monitor.py` 同步至最新版本。")
+        st.caption("⚠️ XRP 书本策略未加载：请同步最新 `xrp_monitor.py`。")
     if cycle is not None:
         render_cycle_context(cycle, snapshot)
     render_portfolio(portfolio, snapshot, plan)
@@ -676,6 +752,7 @@ def render_monitor_panel(refresh_seconds: int) -> None:
     render_trade_advice(advice)
     render_price_chart(chart_data)
     render_signals(signals, cooldown)
+    close_xrp_section()
 
     with st.expander("推送记录", expanded=False):
         if st.session_state.alert_log:
