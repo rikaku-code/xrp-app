@@ -335,6 +335,53 @@ def load_portfolio(
     )
 
 
+def load_persisted_portfolio() -> Portfolio:
+    """优先读取本地保存的持仓；无文件时回退到 .env / Secrets 默认值。"""
+    if os.path.isfile(PORTFOLIO_STATE_FILE):
+        try:
+            with open(PORTFOLIO_STATE_FILE, encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                return Portfolio(
+                    xrp_quantity=max(0.0, float(data.get("holdings_xrp", data.get("xrp_quantity", 0)))),
+                    cash_jpy=max(0.0, float(data.get("available_jpy", data.get("cash_jpy", 0)))),
+                    target_jpy=max(0.0, float(data.get("target_jpy", 0))),
+                )
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            pass
+    return load_portfolio()
+
+
+def save_persisted_portfolio(portfolio: Portfolio) -> None:
+    """保存持仓到 JSON，刷新页面后仍可恢复。"""
+    payload = {
+        "holdings_xrp": portfolio.xrp_quantity,
+        "available_jpy": portfolio.cash_jpy,
+        "target_jpy": portfolio.target_jpy,
+        "updated_at": now_local().isoformat(timespec="seconds"),
+    }
+    with open(PORTFOLIO_STATE_FILE, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+
+def clear_persisted_portfolio() -> None:
+    if os.path.isfile(PORTFOLIO_STATE_FILE):
+        os.remove(PORTFOLIO_STATE_FILE)
+
+
+def portfolio_saved_at() -> str | None:
+    if not os.path.isfile(PORTFOLIO_STATE_FILE):
+        return None
+    try:
+        with open(PORTFOLIO_STATE_FILE, encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, dict) and data.get("updated_at"):
+            return str(data["updated_at"])
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return None
+
+
 def suggest_dca_jpy(cash_jpy: float) -> float:
     if cash_jpy <= 0:
         return 0.0
@@ -351,6 +398,9 @@ def next_milestone(total_assets: float) -> tuple[float, str]:
 
 COOLDOWN_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".alert_cooldown.json"
+)
+PORTFOLIO_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".portfolio.json"
 )
 
 

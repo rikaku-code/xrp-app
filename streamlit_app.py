@@ -173,27 +173,28 @@ def apply_streamlit_secrets() -> None:
 
 
 def init_session_state() -> None:
-    pf = monitor.load_portfolio()
     if "alert_log" not in st.session_state:
         st.session_state.alert_log = []
     if "toast_keys" not in st.session_state:
         st.session_state.toast_keys = set()
-    # 仅首次访问从 .env / Secrets 载入；之后以 session 为准，不被刷新覆盖
-    if "holdings_xrp" not in st.session_state:
+    # 新会话（含浏览器刷新）从磁盘恢复；同会话内不覆盖
+    if "_portfolio_initialized" not in st.session_state:
+        pf = monitor.load_persisted_portfolio()
         st.session_state.holdings_xrp = float(pf.xrp_quantity)
-    if "available_jpy" not in st.session_state:
         st.session_state.available_jpy = float(pf.cash_jpy)
-    if "target_jpy" not in st.session_state:
         st.session_state.target_jpy = float(pf.target_jpy)
+        st.session_state._portfolio_initialized = True
 
 
 def sync_portfolio_state(portfolio: monitor.Portfolio) -> None:
     st.session_state.holdings_xrp = float(portfolio.xrp_quantity)
     st.session_state.available_jpy = float(portfolio.cash_jpy)
     st.session_state.target_jpy = float(portfolio.target_jpy)
+    monitor.save_persisted_portfolio(portfolio)
 
 
 def reset_portfolio_from_config() -> None:
+    monitor.clear_persisted_portfolio()
     sync_portfolio_state(monitor.load_portfolio())
 
 
@@ -346,9 +347,11 @@ def render_sidebar_portfolio() -> None:
             st.rerun()
 
     saved = get_portfolio()
+    saved_at = monitor.portfolio_saved_at()
+    saved_hint = f" · 保存于 {saved_at}" if saved_at else ""
     st.caption(
         f"当前生效：{saved.xrp_quantity:,.0f} XRP · {monitor.fmt_jpy(saved.cash_jpy)} · "
-        f"低吸建议 {monitor.fmt_jpy(monitor.suggest_dca_jpy(saved.cash_jpy))}"
+        f"低吸建议 {monitor.fmt_jpy(monitor.suggest_dca_jpy(saved.cash_jpy))}{saved_hint}"
     )
     if st.button("重置为 Secrets / .env 默认值", use_container_width=True):
         reset_portfolio_from_config()
