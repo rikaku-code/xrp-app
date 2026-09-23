@@ -319,25 +319,6 @@ def render_current_action(
     )
 
 
-def render_portfolio(
-    portfolio: monitor.Portfolio,
-    snapshot: monitor.MarketSnapshot,
-    plan: monitor.RecoveryPlan,
-) -> None:
-    st.subheader("资产概况")
-    pnl = portfolio.pnl(snapshot.price)
-    cols = st.columns(4)
-    cols[0].metric("XRP 持仓", f"{portfolio.xrp_quantity:,.0f} 枚", monitor.fmt_jpy(portfolio.xrp_value(snapshot.price)))
-    cols[1].metric("日元现金", monitor.fmt_jpy(portfolio.cash_jpy))
-    cols[2].metric("总资产", monitor.fmt_jpy(plan.total_assets), f"目标 {monitor.fmt_jpy(portfolio.target_jpy)}")
-    cols[3].metric(
-        "总盈亏",
-        monitor.fmt_jpy(pnl),
-        f"{portfolio.pnl_pct(snapshot.price):+.1f}%",
-        delta_color="normal" if pnl >= 0 else "inverse",
-    )
-
-
 def render_sidebar_portfolio() -> None:
     """左侧栏编辑持仓，点「保存」后生效（自动刷新不会冲掉未保存的草稿）。"""
     st.header("我的资产")
@@ -497,19 +478,18 @@ def render_trend_summary(
 ) -> None:
     """BTC / XRP 共用的趋势判定面板。"""
     trend_icon = {"上涨": "📈", "下跌": "📉", "震荡": "↔️"}.get(ctx.trend, "—")
-    cols = st.columns(4 if show_cycle else 3)
+    cols = st.columns(3)
     cols[0].metric(price_label, monitor.fmt_jpy(ctx.snapshot.price))
     cols[1].metric("趋势判定", f"{trend_icon} {ctx.trend}", f"{strength_label} {ctx.xrp_bias:+.2f}")
+    cols[2].metric(
+        "30日区间",
+        f"{monitor.fmt_jpy(ctx.snapshot.low_30d)} – {monitor.fmt_jpy(ctx.snapshot.high_30d)}",
+    )
     if show_cycle:
-        cols[2].metric("4年阶段", ctx.cycle.phase, f"{ctx.cycle.position_pct:.0f}% 位置")
-        cols[3].metric(
-            "30日区间",
-            f"{monitor.fmt_jpy(ctx.snapshot.low_30d)} – {monitor.fmt_jpy(ctx.snapshot.high_30d)}",
-        )
-    else:
-        cols[2].metric(
-            "30日区间",
-            f"{monitor.fmt_jpy(ctx.snapshot.low_30d)} – {monitor.fmt_jpy(ctx.snapshot.high_30d)}",
+        c = ctx.cycle
+        st.caption(
+            f"4年周期（参考）：**{c.phase}** · 位置 {c.position_pct:.0f}% · "
+            f"{monitor.fmt_jpy(c.range_low)}–{monitor.fmt_jpy(c.range_high)}"
         )
 
     note = operation_note or ""
@@ -528,7 +508,7 @@ def render_coin_portfolio(
     snapshot: monitor.MarketSnapshot,
     plan: monitor.RecoveryPlan,
 ) -> None:
-    st.subheader("资产概况")
+    st.markdown("##### 资产概况")
     if coin == "BTC":
         qty = portfolio.btc_quantity
         value = portfolio.btc_value(snapshot.price)
@@ -540,12 +520,14 @@ def render_coin_portfolio(
     cols = st.columns(4)
     cols[0].metric(f"{coin} 持仓", qty_label, monitor.fmt_jpy(value))
     cols[1].metric("日元现金（共用）", monitor.fmt_jpy(portfolio.cash_jpy))
-    cols[2].metric(
-        f"{coin} 侧估算总资产",
-        monitor.fmt_jpy(plan.total_assets),
-        f"目标 {monitor.fmt_jpy(portfolio.target_jpy)}（全局）",
-    )
+    cols[2].metric(f"{coin} 市值", monitor.fmt_jpy(value))
     cols[3].metric("单次低吸建议", monitor.fmt_jpy(plan.dca_buy_jpy))
+    if portfolio.target_jpy > 0 and coin == "XRP":
+        pnl = portfolio.pnl(snapshot.price)
+        st.caption(
+            f"相对投入目标 {monitor.fmt_jpy(portfolio.target_jpy)}："
+            f"盈亏 {monitor.fmt_jpy(pnl)}（{portfolio.pnl_pct(snapshot.price):+.1f}%）"
+        )
 
 
 def render_btc_section(
@@ -599,7 +581,6 @@ def render_btc_section(
 
         if btc_plan is not None:
             render_coin_portfolio("BTC", portfolio, btc_snapshot, btc_plan)
-            render_recovery_plan(btc_plan, title_prefix="BTC ")
             render_swing_plan(btc_plan, btc_snapshot.price, coin="BTC", cycle_table=False)
         if btc_advice:
             render_trade_advice(btc_advice)
@@ -689,44 +670,26 @@ def render_xrp_section(
             render_technical_context(technical, snapshot, book)
         if book is None and getattr(monitor, "analyze_book_strategies", None) is None:
             st.caption("⚠️ XRP 书本策略未加载：请同步最新 `xrp_monitor.py`。")
-        if cycle is not None:
-            render_cycle_context(cycle, snapshot)
         render_coin_portfolio("XRP", portfolio, snapshot, plan)
-        render_recovery_plan(plan)
         if cycle is not None:
+            render_cycle_context(cycle)
             render_swing_plan(plan, snapshot.price, coin="XRP", cycle_table=True)
         render_trade_advice(advice)
         render_price_chart(chart_data)
         render_signals(signals, cooldown)
 
 
-def render_cycle_context(cycle: monitor.CycleContext, snapshot: monitor.MarketSnapshot) -> None:
-    st.markdown("#### XRP 4 年周期参考（不单独触发买卖）")
-    st.progress(
-        cycle.position_pct / 100,
-        text=(
-            f"4年位置 {cycle.position_pct:.0f}% · {cycle.phase} · "
-            f"区间 {monitor.fmt_jpy(cycle.range_low)} – {monitor.fmt_jpy(cycle.range_high)}"
-        ),
+def render_cycle_context(cycle: monitor.CycleContext) -> None:
+    label = (
+        f"4年周期详情 · {cycle.phase}（{cycle.position_pct:.0f}%）· "
+        f"回落 {cycle.drawdown_pct:.0f}% · {cycle.halving_label}"
     )
-    cols = st.columns(4)
-    cols[0].metric("周期阶段", cycle.phase, cycle.halving_label)
-    cols[1].metric("自高点回落", f"{cycle.drawdown_pct:.0f}%", f"高点 {monitor.fmt_jpy(cycle.range_high)}")
-    cols[2].metric(f"{cycle.month}月季节", cycle.month_strength, f"月均 {cycle.month_return_pct:+.1f}%")
-    cols[3].metric("样本天数", f"{cycle.data_days} 天", cycle.month_history[:20] + "…")
-    st.caption(f"{cycle.phase_detail} · 以下价位仅供挂单参考，须等 RSI 等技术信号确认后再操作")
-
-
-def render_recovery_plan(plan: monitor.RecoveryPlan, *, title_prefix: str = "") -> None:
-    st.subheader(f"{title_prefix}回本进度")
-    st.progress(
-        plan.recovery_pct,
-        text=f"当前 {monitor.fmt_jpy(plan.total_assets)} / 目标 {monitor.fmt_jpy(plan.target_jpy)} · 还差 {monitor.fmt_jpy(plan.recovery_gap)}",
-    )
-    cols = st.columns(3)
-    cols[0].metric("下一目标", plan.next_milestone_label, f"还差 {monitor.fmt_jpy(plan.next_milestone - plan.total_assets)}")
-    cols[1].metric("纯持有需涨至", monitor.fmt_jpy(plan.hold_only_price), "不含波段操作")
-    cols[2].metric("单次波段预期", monitor.fmt_jpy(plan.swing_cycle_profit), f"基于 {monitor.fmt_jpy(plan.dca_buy_jpy)} 低吸 +12%")
+    with st.expander(label, expanded=False):
+        st.progress(cycle.position_pct / 100)
+        st.caption(
+            f"{cycle.phase_detail} · {cycle.month}月{cycle.month_strength}（月均 {cycle.month_return_pct:+.1f}%）"
+            f" · {cycle.month_history} · 仅供挂单参考，须 RSI 确认"
+        )
 
 
 def render_swing_plan(
@@ -736,13 +699,13 @@ def render_swing_plan(
     coin: str = "XRP",
     cycle_table: bool = True,
 ) -> None:
-    title = "周期参考价位表（需 RSI 确认）" if cycle_table else "30 日波段参考价位（需 RSI 确认）"
-    st.subheader(title)
-    st.caption("表中为挂单参考位，**不等于立即买入/卖出**。")
+    title = "周期参考价位（需 RSI 确认）" if cycle_table else "30 日波段参考价位（需 RSI 确认）"
+    st.markdown(f"##### {title}")
+    st.caption("挂单参考位，**不等于立即买卖**。")
     col_buy, col_sell = st.columns(2)
 
     with col_buy:
-        st.markdown("#### 📋 参考低吸位")
+        st.markdown("**参考低吸位**")
         if plan.buy_steps:
             for step in plan.buy_steps:
                 near = abs(current_price - step.trigger_price) / step.trigger_price < 0.03
@@ -766,7 +729,7 @@ def render_swing_plan(
             st.caption("暂无参考低吸位")
 
     with col_sell:
-        st.markdown("#### 📋 参考高抛位")
+        st.markdown("**参考高抛位**")
         if plan.sell_steps:
             for step in plan.sell_steps:
                 near = abs(current_price - step.trigger_price) / step.trigger_price < 0.03
