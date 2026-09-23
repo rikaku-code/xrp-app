@@ -33,6 +33,7 @@ QUIET_HOUR_END = 8
 
 # ── 持仓与回本目标 ────────────────────────────────────────────
 DEFAULT_HOLDINGS_XRP = 1258.0
+DEFAULT_HOLDINGS_BTC = 0.0
 DEFAULT_AVAILABLE_JPY = 11_000.0
 DEFAULT_TARGET_JPY = 1_200_000.0
 DCA_FRACTION = 1 / 3
@@ -100,17 +101,29 @@ BTC_MARKET = MarketSpec("btc_jpy", "BTCJPY", "bitcoin", "BTC/JPY")
 
 @dataclass(frozen=True)
 class Portfolio:
-    """当前资产：XRP 数量 + 现金 + 原始投入目标。"""
+    """当前资产：XRP / BTC 数量 + 现金 + 原始投入目标。"""
 
     xrp_quantity: float
     cash_jpy: float
     target_jpy: float
+    btc_quantity: float = 0.0
 
     def xrp_value(self, price: float) -> float:
         return self.xrp_quantity * price
 
-    def total_assets(self, price: float) -> float:
-        return self.xrp_value(price) + self.cash_jpy
+    def btc_value(self, price: float) -> float:
+        return self.btc_quantity * price
+
+    def holdings_qty(self, market: MarketSpec) -> float:
+        if market == BTC_MARKET:
+            return self.btc_quantity
+        return self.xrp_quantity
+
+    def total_assets(self, xrp_price: float, btc_price: float | None = None) -> float:
+        total = self.xrp_value(xrp_price) + self.cash_jpy
+        if btc_price is not None:
+            total += self.btc_value(btc_price)
+        return total
 
     def pnl(self, price: float) -> float:
         return self.total_assets(price) - self.target_jpy
@@ -129,23 +142,47 @@ class Portfolio:
         return min(1.0, self.total_assets(price) / self.target_jpy)
 
     def after_buy(self, buy_jpy: float, price: float) -> "Portfolio":
+        return self.after_buy_coin(buy_jpy, price, XRP_MARKET)
+
+    def after_sell(self, sell_qty: float, price: float) -> "Portfolio":
+        return self.after_sell_coin(sell_qty, price, XRP_MARKET)
+
+    def after_buy_coin(self, buy_jpy: float, price: float, market: MarketSpec) -> "Portfolio":
         if buy_jpy <= 0 or price <= 0:
             return self
         spend = min(buy_jpy, self.cash_jpy)
         if spend <= 0:
             return self
+        add = spend / price
+        if market == BTC_MARKET:
+            return Portfolio(
+                xrp_quantity=self.xrp_quantity,
+                btc_quantity=self.btc_quantity + add,
+                cash_jpy=self.cash_jpy - spend,
+                target_jpy=self.target_jpy,
+            )
         return Portfolio(
-            xrp_quantity=self.xrp_quantity + spend / price,
+            xrp_quantity=self.xrp_quantity + add,
+            btc_quantity=self.btc_quantity,
             cash_jpy=self.cash_jpy - spend,
             target_jpy=self.target_jpy,
         )
 
-    def after_sell(self, sell_qty: float, price: float) -> "Portfolio":
+    def after_sell_coin(self, sell_qty: float, price: float, market: MarketSpec) -> "Portfolio":
         if sell_qty <= 0 or price <= 0:
             return self
+        if market == BTC_MARKET:
+            qty = min(sell_qty, self.btc_quantity)
+            return Portfolio(
+                xrp_quantity=self.xrp_quantity,
+                btc_quantity=self.btc_quantity - qty,
+                cash_jpy=self.cash_jpy + qty * price,
+                target_jpy=self.target_jpy,
+            )
         qty = min(sell_qty, self.xrp_quantity)
         return Portfolio(
             xrp_quantity=self.xrp_quantity - qty,
+            btc_quantity=self.btc_quantity,
             cash_jpy=self.cash_jpy + qty * price,
             target_jpy=self.target_jpy,
         )
@@ -189,6 +226,7 @@ class CurrentAction:
     action: str
     title: str
     reason: str
+    asset: str
     buy_jpy: float
     buy_xrp: float
     sell_xrp: float
@@ -343,11 +381,15 @@ reload_config()
 
 def load_portfolio(
     xrp_quantity: float | None = None,
+    btc_quantity: float | None = None,
     cash_jpy: float | None = None,
     target_jpy: float | None = None,
 ) -> Portfolio:
     qty = xrp_quantity if xrp_quantity is not None else float(
         os.getenv("HOLDINGS_XRP", DEFAULT_HOLDINGS_XRP)
+    )
+    btc = btc_quantity if btc_quantity is not None else float(
+        os.getenv("HOLDINGS_BTC", DEFAULT_HOLDINGS_BTC)
     )
     cash = cash_jpy if cash_jpy is not None else float(
         os.getenv("AVAILABLE_JPY", DEFAULT_AVAILABLE_JPY)
@@ -357,6 +399,7 @@ def load_portfolio(
     )
     return Portfolio(
         xrp_quantity=max(0.0, qty),
+        btc_quantity=max(0.0, btc),
         cash_jpy=max(0.0, cash),
         target_jpy=max(0.0, target),
     )
@@ -371,6 +414,7 @@ def load_persisted_portfolio() -> Portfolio:
             if isinstance(data, dict):
                 return Portfolio(
                     xrp_quantity=max(0.0, float(data.get("holdings_xrp", data.get("xrp_quantity", 0)))),
+                    btc_quantity=max(0.0, float(data.get("holdings_btc", data.get("btc_quantity", 0)))),
                     cash_jpy=max(0.0, float(data.get("available_jpy", data.get("cash_jpy", 0)))),
                     target_jpy=max(0.0, float(data.get("target_jpy", 0))),
                 )
@@ -383,6 +427,7 @@ def save_persisted_portfolio(portfolio: Portfolio) -> None:
     """保存持仓到 JSON，刷新页面后仍可恢复。"""
     payload = {
         "holdings_xrp": portfolio.xrp_quantity,
+        "holdings_btc": portfolio.btc_quantity,
         "available_jpy": portfolio.cash_jpy,
         "target_jpy": portfolio.target_jpy,
         "updated_at": now_local().isoformat(timespec="seconds"),
@@ -1350,15 +1395,22 @@ def _cycle_amount_scale(cycle: CycleContext, base_strength: float) -> float:
     return scale
 
 
+def _coin_symbol(market: MarketSpec) -> str:
+    return "BTC" if market == BTC_MARKET else "XRP"
+
+
 def build_recovery_plan(
     snapshot: MarketSnapshot,
     portfolio: Portfolio,
     cycle: CycleContext,
     technical: TechnicalContext,
     book: BookStrategyContext,
+    market: MarketSpec = XRP_MARKET,
 ) -> RecoveryPlan:
     p = snapshot.price
-    total = portfolio.total_assets(p)
+    coin = _coin_symbol(market)
+    coin_qty = portfolio.holdings_qty(market)
+    total = portfolio.cash_jpy + coin_qty * p
     gap = portfolio.recovery_gap(p)
     pct = portfolio.recovery_pct(p)
     dca_jpy = suggest_dca_jpy(portfolio.cash_jpy)
@@ -1388,7 +1440,7 @@ def build_recovery_plan(
         if key in seen_prices:
             continue
         seen_prices.add(key)
-        after = portfolio.after_buy(amount, trigger)
+        after = portfolio.after_buy_coin(amount, trigger, market)
         buy_steps.append(
             PlanStep(
                 action="参考",
@@ -1396,8 +1448,8 @@ def build_recovery_plan(
                 trigger_label=f"{label}（{cond}）",
                 amount_desc=f"若触发 · 约 {fmt_jpy(amount)}",
                 result_desc=(
-                    f"周期参考位，非立即操作 · 4年阶段 {cycle.phase} · "
-                    f"预计总资产 {fmt_jpy(after.total_assets(trigger))}"
+                    f"{coin} 周期参考位 · 4年阶段 {cycle.phase} · "
+                    f"预计资产 {fmt_jpy(after.cash_jpy + after.holdings_qty(market) * trigger)}"
                 ),
                 amount_jpy=amount,
                 amount_xrp=amount / trigger if trigger > 0 else 0.0,
@@ -1416,14 +1468,14 @@ def build_recovery_plan(
         if key in seen_sell:
             continue
         seen_sell.add(key)
-        sell_qty = portfolio.xrp_quantity * fraction
+        sell_qty = coin_qty * fraction
         proceeds = sell_qty * trigger
         sell_steps.append(
             PlanStep(
                 action="参考",
                 trigger_price=trigger,
                 trigger_label=f"{label}（{cond}）",
-                amount_desc=f"若触发 · 约卖 {sell_qty:,.0f} XRP",
+                amount_desc=f"若触发 · 约卖 {sell_qty:,.4f} {coin}" if coin == "BTC" else f"若触发 · 约卖 {sell_qty:,.0f} {coin}",
                 result_desc=(
                     f"周期参考位，非立即操作 · 4年阶段 {cycle.phase} · "
                     f"落袋约 {fmt_jpy(proceeds)}"
@@ -1599,32 +1651,43 @@ def build_current_action(
     snapshot: MarketSnapshot,
     portfolio: Portfolio,
     plan: RecoveryPlan,
-    btc: AssetTrendContext | None = None,
+    market: MarketSpec = XRP_MARKET,
 ) -> CurrentAction:
     p = snapshot.price
     dca_jpy = plan.dca_buy_jpy
     cycle = plan.cycle
     tech = plan.technical
     book = plan.book
-    btc_suffix = f" · {btc_xrp_linkage_note(btc)}" if btc else ""
+    coin = _coin_symbol(market)
+    holdings = portfolio.holdings_qty(market)
     next_buy = plan.buy_steps[0] if plan.buy_steps else None
     next_sell = plan.sell_steps[0] if plan.sell_steps else None
     nb = next_buy.trigger_price if next_buy else cycle.p25_price
     ns = next_sell.trigger_price if next_sell else cycle.p75_price
 
-    # 移动止损：跌破实体均线 → 剩余全部平仓（图 123/125）
-    if book.trailing_stop_exit:
-        sell_qty = portfolio.xrp_quantity
-        return CurrentAction(
-            action="卖出",
-            title="书本策略 · 移动止损平仓",
-            reason=book.sell_alerts[-1] if book.sell_alerts else "跌破实体短期均线",
+    def _act(**kwargs: Any) -> CurrentAction:
+        base = dict(
+            asset=coin,
             buy_jpy=0.0,
             buy_xrp=0.0,
-            sell_xrp=sell_qty,
-            sell_jpy=sell_qty * p,
+            sell_xrp=0.0,
+            sell_jpy=0.0,
             next_buy_price=nb,
             next_sell_price=ns,
+            trigger_price=None,
+        )
+        base.update(kwargs)
+        return CurrentAction(**base)
+
+    # 移动止损：跌破实体均线 → 剩余全部平仓（图 123/125）
+    if book.trailing_stop_exit:
+        sell_qty = holdings
+        return _act(
+            action="卖出",
+            title=f"{coin} · 书本策略 · 移动止损平仓",
+            reason=book.sell_alerts[-1] if book.sell_alerts else "跌破实体短期均线",
+            sell_xrp=sell_qty,
+            sell_jpy=sell_qty * p,
             trigger_price=p,
         )
 
