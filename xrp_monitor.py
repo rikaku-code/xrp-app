@@ -351,6 +351,8 @@ class Signal:
     card_template: str
     card_body: str
     color: str
+    market: str = "XRP"
+    lark_pair_label: str = PAIR_LABEL
 
 
 def _load_dotenv() -> None:
@@ -803,13 +805,16 @@ def _body_close_ma(daily: pd.DataFrame) -> float:
     return float(body.rolling(BODY_MA_PERIOD).mean().iloc[-1])
 
 
-def _nearest_target_price(snapshot: MarketSnapshot, cycle: CycleContext) -> float | None:
-    """分批止盈目标位：30 日高点 / 4 年 75% 分位 / 区间高点。"""
-    candidates = [
-        snapshot.high_30d,
-        cycle.p75_price,
-        cycle.range_high * 0.90,
-    ]
+def _nearest_target_price(
+    snapshot: MarketSnapshot,
+    cycle: CycleContext,
+    *,
+    use_cycle_targets: bool = True,
+) -> float | None:
+    """分批止盈目标位：30 日高点；XRP 另含 4 年分位。"""
+    candidates = [snapshot.high_30d]
+    if use_cycle_targets:
+        candidates.extend([cycle.p75_price, cycle.range_high * 0.90])
     valid = [c for c in candidates if c > 0 and snapshot.price >= c * (1 - TARGET_PROXIMITY)]
     return max(valid) if valid else None
 
@@ -819,6 +824,9 @@ def analyze_book_strategies(
     snapshot: MarketSnapshot,
     portfolio: Portfolio,
     cycle: CycleContext,
+    market: MarketSpec = XRP_MARKET,
+    *,
+    use_cycle_targets: bool = True,
 ) -> BookStrategyContext:
     """整合书本策略：背离、Selling Climax、ADX+Stoch、顺势加仓、分批止盈、移动止损。"""
     row = daily.iloc[-1]
@@ -842,7 +850,10 @@ def analyze_book_strategies(
     selling_climax, vol_ratio = _detect_selling_climax(daily)
     resistance, resistance_breakout = _resistance_breakout(daily)
     body_ma = _body_close_ma(daily)
-    target_price = _nearest_target_price(snapshot, cycle)
+    holdings = portfolio.holdings_qty(market)
+    target_price = _nearest_target_price(
+        snapshot, cycle, use_cycle_targets=use_cycle_targets
+    )
 
     # 量比（无论是否 Climax 均记录）
     vol_ratio = 0.0
@@ -884,7 +895,8 @@ def analyze_book_strategies(
 
     # ADX>35 + Stoch K≥80 死叉 + 长上影 → 阶段性止盈（图 115）
     partial_take_profit = (
-        adx_strong
+        holdings > 0
+        and adx_strong
         and snapshot.stoch_dead
         and snapshot.stoch_k >= STOCH_OVERBOUGHT
         and long_upper
@@ -895,7 +907,7 @@ def analyze_book_strategies(
         )
 
     # 到达目标位 → 分批 1/3 止盈（图 123/125）
-    partial_profit_at_target = target_price is not None and portfolio.xrp_quantity > 0
+    partial_profit_at_target = target_price is not None and holdings > 0
     if partial_profit_at_target and target_price is not None:
         sell_alerts.append(
             f"价格触及目标位 {fmt_jpy(target_price)} → 建议分批 {DCA_FRACTION:.0%} 止盈"
@@ -903,7 +915,7 @@ def analyze_book_strategies(
 
     # 收盘价跌破实体短期均线 → 剩余持仓平仓（图 123/125 移动止损）
     trailing_stop_exit = (
-        portfolio.xrp_quantity > 0 and close < body_ma and snapshot.price < body_ma
+        holdings > 0 and close < body_ma and snapshot.price < body_ma
     )
     if trailing_stop_exit:
         sell_alerts.append(
@@ -1047,6 +1059,14 @@ def build_trend_context(
     )
 
 
+def btc_trend_operation_note(btc: AssetTrendContext) -> str:
+    if btc.trend == "上涨":
+        return "BTC 趋势上涨 → 持有/低吸为主，书本与 RSI 买点可信度较高"
+    if btc.trend == "下跌":
+        return "BTC 趋势下跌 → 宜防守，优先等超卖或书本抄底信号"
+    return "BTC 趋势震荡 → 按 RSI / Stoch 波段，不追涨杀跌"
+
+
 def xrp_trend_operation_note(
     xrp: AssetTrendContext,
     btc: AssetTrendContext | None = None,
@@ -1072,7 +1092,10 @@ def build_asset_analysis(
     cycle = analyze_cycle(daily, snapshot.price)
     technical = analyze_technicals(snapshot)
     pf = portfolio or Portfolio(0.0, 0.0, 0.0)
-    book = analyze_book_strategies(daily, snapshot, pf, cycle)
+    use_cycle = market != BTC_MARKET
+    book = analyze_book_strategies(
+        daily, snapshot, pf, cycle, market, use_cycle_targets=use_cycle
+    )
     trend, detail, bias = derive_market_trend(snapshot, technical, book)
     return AssetTrendContext(
         market=market.label,
@@ -1399,6 +1422,23 @@ def _coin_symbol(market: MarketSpec) -> str:
     return "BTC" if market == BTC_MARKET else "XRP"
 
 
+def _plan_uses_cycle(market: MarketSpec) -> bool:
+    return market != BTC_MARKET
+
+
+def _buy_amount_scale(cycle: CycleContext, tech: TechnicalContext, market: MarketSpec) -> float:
+    strength = tech.buy_strength
+    if not _plan_uses_cycle(market):
+        return strength
+    return _cycle_amount_scale(cycle, strength)
+
+
+def _cycle_phase_note(cycle: CycleContext, market: MarketSpec) -> str:
+    if not _plan_uses_cycle(market):
+        return ""
+    return f" · 周期参考 {cycle.phase}"
+
+
 def build_recovery_plan(
     snapshot: MarketSnapshot,
     portfolio: Portfolio,
@@ -1426,12 +1466,17 @@ def build_recovery_plan(
     buy_steps: list[PlanStep] = []
     sell_steps: list[PlanStep] = []
 
-    buy_levels = [
+    buy_levels: list[tuple[float, str, float, str]] = [
         (snapshot.low_30d, "30日低点", dca_jpy, f"RSI<{DAILY_RSI_EXTREME} 且近低点"),
-        (cycle.p25_price, "4年 25% 分位", dca_jpy * 0.75 if dca_jpy else 0, f"RSI<{RSI_OVERSOLD} 时参考"),
-        (cycle.p50_price, "4年 50% 分位", dca_jpy * 0.5 if dca_jpy else 0, f"RSI<{RSI_OVERSOLD} 时参考"),
-        (cycle.range_low, "4年最低点", dca_jpy, f"RSI<{DAILY_RSI_EXTREME} 时参考"),
     ]
+    if _plan_uses_cycle(market):
+        buy_levels.extend(
+            [
+                (cycle.p25_price, "4年 25% 分位", dca_jpy * 0.75 if dca_jpy else 0, f"RSI<{RSI_OVERSOLD} 时参考"),
+                (cycle.p50_price, "4年 50% 分位", dca_jpy * 0.5 if dca_jpy else 0, f"RSI<{RSI_OVERSOLD} 时参考"),
+                (cycle.range_low, "4年最低点", dca_jpy, f"RSI<{DAILY_RSI_EXTREME} 时参考"),
+            ]
+        )
     seen_prices: set[int] = set()
     for trigger, label, amount, cond in buy_levels:
         if amount <= 0:
@@ -1448,20 +1493,29 @@ def build_recovery_plan(
                 trigger_label=f"{label}（{cond}）",
                 amount_desc=f"若触发 · 约 {fmt_jpy(amount)}",
                 result_desc=(
-                    f"{coin} 周期参考位 · 4年阶段 {cycle.phase} · "
-                    f"预计资产 {fmt_jpy(after.cash_jpy + after.holdings_qty(market) * trigger)}"
+                    (
+                        f"{coin} 周期参考位 · 4年阶段 {cycle.phase} · "
+                        if _plan_uses_cycle(market)
+                        else f"{coin} 波段参考位 · "
+                    )
+                    + f"预计资产 {fmt_jpy(after.cash_jpy + after.holdings_qty(market) * trigger)}"
                 ),
                 amount_jpy=amount,
                 amount_xrp=amount / trigger if trigger > 0 else 0.0,
             )
         )
 
-    sell_levels = [
-        (cycle.p75_price, "4年 75% 分位", SWING_SELL_FRACTION, f"RSI≥{RSI_OVERBOUGHT} 时参考"),
-        (cycle.range_high * 0.90, "4年高点 -10%", SWING_SELL_FRACTION, f"RSI≥65 时参考"),
-        (cycle.range_high, "4年最高点", SWING_SELL_FRACTION_HIGH, f"RSI≥{RSI_OVERBOUGHT} 分批"),
+    sell_levels: list[tuple[float, str, float, str]] = [
         (snapshot.high_30d, "30日高点", SWING_SELL_FRACTION, f"RSI≥{RSI_OVERBOUGHT} 时参考"),
     ]
+    if _plan_uses_cycle(market):
+        sell_levels.extend(
+            [
+                (cycle.p75_price, "4年 75% 分位", SWING_SELL_FRACTION, f"RSI≥{RSI_OVERBOUGHT} 时参考"),
+                (cycle.range_high * 0.90, "4年高点 -10%", SWING_SELL_FRACTION, f"RSI≥65 时参考"),
+                (cycle.range_high, "4年最高点", SWING_SELL_FRACTION_HIGH, f"RSI≥{RSI_OVERBOUGHT} 分批"),
+            ]
+        )
     seen_sell: set[int] = set()
     for trigger, label, fraction, cond in sell_levels:
         key = int(trigger)
@@ -1477,8 +1531,12 @@ def build_recovery_plan(
                 trigger_label=f"{label}（{cond}）",
                 amount_desc=f"若触发 · 约卖 {sell_qty:,.4f} {coin}" if coin == "BTC" else f"若触发 · 约卖 {sell_qty:,.0f} {coin}",
                 result_desc=(
-                    f"周期参考位，非立即操作 · 4年阶段 {cycle.phase} · "
-                    f"落袋约 {fmt_jpy(proceeds)}"
+                    (
+                        f"周期参考位，非立即操作 · 4年阶段 {cycle.phase} · "
+                        if _plan_uses_cycle(market)
+                        else "波段参考位，非立即操作 · "
+                    )
+                    + f"落袋约 {fmt_jpy(proceeds)}"
                 ),
                 amount_jpy=proceeds,
                 amount_xrp=sell_qty,
@@ -1510,15 +1568,18 @@ def generate_trade_advice(
     snapshot: MarketSnapshot,
     portfolio: Portfolio,
     plan: RecoveryPlan,
+    market: MarketSpec = XRP_MARKET,
     btc: AssetTrendContext | None = None,
 ) -> list[TradeAdvice]:
     advice: list[TradeAdvice] = []
     p = snapshot.price
     dca_jpy = plan.dca_buy_jpy
-    total = plan.total_assets
     cycle = plan.cycle
     tech = plan.technical
     book = plan.book
+    coin = _coin_symbol(market)
+    holdings = portfolio.holdings_qty(market)
+    qty_fmt = f"{holdings:,.4f}" if coin == "BTC" else f"{holdings:,.0f}"
 
     if portfolio.target_jpy <= 0:
         advice.append(
@@ -1532,20 +1593,21 @@ def generate_trade_advice(
         )
         return advice
 
-    advice.append(
-        TradeAdvice(
-            action="持有",
-            strength="参考",
-            title=f"4年周期 · {cycle.phase}（{cycle.position_pct:.0f}%）",
-            reason=(
-                f"{cycle.halving_label} · {cycle.month}月{cycle.month_strength} · "
-                f"区间 {fmt_jpy(cycle.range_low)}–{fmt_jpy(cycle.range_high)}"
-            ),
-            detail=f"{cycle.phase_detail} · {cycle.month_history}（仅供参考，不单独触发买卖）",
+    if _plan_uses_cycle(market):
+        advice.append(
+            TradeAdvice(
+                action="持有",
+                strength="参考",
+                title=f"4年周期 · {cycle.phase}（{cycle.position_pct:.0f}%）",
+                reason=(
+                    f"{cycle.halving_label} · {cycle.month}月{cycle.month_strength} · "
+                    f"区间 {fmt_jpy(cycle.range_low)}–{fmt_jpy(cycle.range_high)}"
+                ),
+                detail=f"{cycle.phase_detail} · {cycle.month_history}（仅供参考，不单独触发买卖）",
+            )
         )
-    )
 
-    if btc is not None:
+    if btc is not None and market == XRP_MARKET:
         b = btc
         advice.append(
             TradeAdvice(
@@ -1579,19 +1641,22 @@ def generate_trade_advice(
         )
 
     if tech.buy_triggered and dca_jpy > 0:
-        strength = _cycle_amount_scale(cycle, tech.buy_strength)
+        strength = _buy_amount_scale(cycle, tech, market)
         amount = dca_jpy * strength
+        buy_qty = amount / p if p > 0 else 0.0
+        buy_qty_s = f"{buy_qty:.4f}" if coin == "BTC" else f"{buy_qty:.1f}"
+        cycle_hint = (
+            f"周期参考：{cycle.phase}，可挂 {fmt_jpy(cycle.p25_price)} / {fmt_jpy(cycle.range_low)}。"
+            if _plan_uses_cycle(market)
+            else f"可参考 30 日低点 {fmt_jpy(snapshot.low_30d)} 挂单。"
+        )
         advice.append(
             TradeAdvice(
                 action="买入",
                 strength="强烈建议" if strength >= 0.9 else "建议",
-                title="技术信号 · 执行买入",
+                title=f"{coin} 技术信号 · 执行买入",
                 reason=tech.buy_reason,
-                detail=(
-                    f"建议投入 {fmt_jpy(amount)} 买入约 {amount / p:.1f} XRP。"
-                    f"周期参考：{cycle.phase}，可挂低于现价位 "
-                    f"{fmt_jpy(cycle.p25_price)} / {fmt_jpy(cycle.range_low)}。"
-                ),
+                detail=f"建议投入 {fmt_jpy(amount)} 买入约 {buy_qty_s} {coin}。{cycle_hint}",
             )
         )
     elif tech.buy_triggered:
@@ -1605,20 +1670,23 @@ def generate_trade_advice(
             )
         )
 
-    if tech.sell_triggered:
+    if tech.sell_triggered and holdings > 0:
         fraction = max(SWING_SELL_FRACTION * 0.5, SWING_SELL_FRACTION * tech.sell_strength)
-        sell_qty = portfolio.xrp_quantity * fraction
+        sell_qty = holdings * fraction
         sell_strength = tech.sell_strength
+        sell_qty_s = f"{sell_qty:,.4f}" if coin == "BTC" else f"{sell_qty:,.0f}"
+        cycle_hint = (
+            f"周期参考卖点 {fmt_jpy(cycle.p75_price)} / {fmt_jpy(cycle.range_high)}。"
+            if _plan_uses_cycle(market)
+            else f"可参考 30 日高点 {fmt_jpy(snapshot.high_30d)}。"
+        )
         advice.append(
             TradeAdvice(
                 action="卖出",
                 strength="建议" if sell_strength >= 0.75 else "可考虑",
-                title="技术信号 · 分批卖出",
+                title=f"{coin} 技术信号 · 分批卖出",
                 reason=tech.sell_reason,
-                detail=(
-                    f"建议卖出约 {sell_qty:,.0f} XRP（{fmt_jpy(sell_qty * p)}）。"
-                    f"周期参考卖点 {fmt_jpy(cycle.p75_price)} / {fmt_jpy(cycle.range_high)}。"
-                ),
+                detail=f"建议卖出约 {sell_qty_s} {coin}（{fmt_jpy(sell_qty * p)}）。{cycle_hint}",
             )
         )
 
@@ -1658,8 +1726,12 @@ def build_current_action(
     holdings = portfolio.holdings_qty(market)
     next_buy = plan.buy_steps[0] if plan.buy_steps else None
     next_sell = plan.sell_steps[0] if plan.sell_steps else None
-    nb = next_buy.trigger_price if next_buy else cycle.p25_price
-    ns = next_sell.trigger_price if next_sell else cycle.p75_price
+    if _plan_uses_cycle(market):
+        nb = next_buy.trigger_price if next_buy else cycle.p25_price
+        ns = next_sell.trigger_price if next_sell else cycle.p75_price
+    else:
+        nb = next_buy.trigger_price if next_buy else snapshot.low_30d
+        ns = next_sell.trigger_price if next_sell else snapshot.high_30d
 
     def _act(**kwargs: Any) -> CurrentAction:
         base = dict(
@@ -1710,7 +1782,7 @@ def build_current_action(
         return _act(
             action="卖出",
             title=f"{coin} · 技术信号 · 分批卖出",
-            reason=f"{tech.sell_reason} · 周期参考 {cycle.phase}",
+            reason=f"{tech.sell_reason}{_cycle_phase_note(cycle, market)}",
             sell_xrp=sell_qty,
             sell_jpy=sell_qty * p,
             trigger_price=p,
@@ -1752,12 +1824,12 @@ def build_current_action(
         )
 
     if tech.buy_triggered and dca_jpy > 0:
-        strength = _cycle_amount_scale(cycle, tech.buy_strength)
+        strength = _buy_amount_scale(cycle, tech, market)
         amount = dca_jpy * strength
         return _act(
             action="买入",
             title=f"{coin} · 技术信号 · 执行买入",
-            reason=f"{tech.buy_reason} · 周期参考 {cycle.phase}",
+            reason=f"{tech.buy_reason}{_cycle_phase_note(cycle, market)}",
             buy_jpy=amount,
             buy_xrp=amount / p if p > 0 else 0.0,
             trigger_price=p,
@@ -1773,7 +1845,14 @@ def build_current_action(
     return _act(
         action="等待",
         title=f"{coin} · 技术未触发 · 持有观望",
-        reason=f"RSI {tech.rsi:.0f}（{tech.rsi_zone}）· 周期 {cycle.phase} 仅供参考",
+        reason=(
+            f"RSI {tech.rsi:.0f}（{tech.rsi_zone}）"
+            + (
+                f" · 周期 {cycle.phase} 仅供参考"
+                if _plan_uses_cycle(market)
+                else " · 30 日区间波段参考"
+            )
+        ),
     )
 
 
@@ -1781,63 +1860,88 @@ def detect_signals(
     snapshot: MarketSnapshot,
     portfolio: Portfolio,
     plan: RecoveryPlan,
+    market: MarketSpec = XRP_MARKET,
 ) -> list[Signal]:
     signals: list[Signal] = []
     p = snapshot.price
     cycle = plan.cycle
     tech = plan.technical
     book = plan.book
-    action = build_current_action(snapshot, portfolio, plan)
+    coin = _coin_symbol(market)
+    holdings = portfolio.holdings_qty(market)
+    key_prefix = "btc_" if market == BTC_MARKET else ""
+    lark_label = "BTC/JPY" if market == BTC_MARKET else PAIR_LABEL
+    market_tag = "BTC" if market == BTC_MARKET else "XRP"
+    action = build_current_action(snapshot, portfolio, plan, market)
+
+    def _qty_str(qty: float) -> str:
+        return f"{qty:,.4f}" if coin == "BTC" else f"{qty:,.0f}"
 
     if action.action == "买入" and action.buy_jpy > 0:
-        msg = f"💡【技术买点】{tech.buy_reason} · 建议 {fmt_jpy(action.buy_jpy)}"
+        msg = f"💡【{coin} 技术买点】{tech.buy_reason} · 建议 {fmt_jpy(action.buy_jpy)}"
+        cycle_block = (
+            f"**周期参考：** {cycle.phase}（{cycle.position_pct:.0f}%）\n"
+            f"**4年区间：** {fmt_jpy(cycle.range_low)} – {fmt_jpy(cycle.range_high)}"
+            if _plan_uses_cycle(market)
+            else f"**30日区间：** {fmt_jpy(snapshot.low_30d)} – {fmt_jpy(snapshot.high_30d)}"
+        )
         signals.append(
             Signal(
-                key="tech_buy",
-                title="RSI 买点",
+                key=f"{key_prefix}tech_buy",
+                title=f"{coin} RSI 买点",
                 console_msg=msg,
                 card_template="green",
                 card_body=(
                     f"{msg}\n\n"
                     f"**价格：** {fmt_jpy(p)} · RSI {tech.rsi:.0f}\n"
-                    f"**周期参考：** {cycle.phase}（{cycle.position_pct:.0f}%）\n"
-                    f"**4年区间：** {fmt_jpy(cycle.range_low)} – {fmt_jpy(cycle.range_high)}"
+                    f"{cycle_block}"
                 ),
                 color=f"{Fore.GREEN}{Style.BRIGHT}",
+                market=market_tag,
+                lark_pair_label=lark_label,
             )
         )
 
     if action.action == "卖出" and action.sell_xrp > 0:
-        msg = f"📤【技术卖点】{tech.sell_reason} · 约 {action.sell_xrp:,.0f} XRP"
+        msg = f"📤【{coin} 技术卖点】{tech.sell_reason} · 约 {_qty_str(action.sell_xrp)} {coin}"
+        cycle_line = (
+            f"**周期参考：** {cycle.phase}"
+            if _plan_uses_cycle(market)
+            else f"**30日高点：** {fmt_jpy(snapshot.high_30d)}"
+        )
         signals.append(
             Signal(
-                key="tech_sell",
-                title="RSI 卖点",
+                key=f"{key_prefix}tech_sell",
+                title=f"{coin} RSI 卖点",
                 console_msg=msg,
                 card_template="blue",
                 card_body=(
                     f"{msg}\n\n"
                     f"**价格：** {fmt_jpy(p)} · RSI {tech.rsi:.0f}\n"
-                    f"**周期参考：** {cycle.phase}\n"
+                    f"{cycle_line}\n"
                     f"**回收约：** {fmt_jpy(action.sell_jpy)}"
                 ),
                 color=f"{Fore.CYAN}{Style.BRIGHT}",
+                market=market_tag,
+                lark_pair_label=lark_label,
             )
         )
 
     # ── 书本策略 Lark 提醒 ─────────────────────────────────────
     def _book_buy_signal(key: str, title: str, reason: str) -> None:
         buy_jpy = suggest_dca_jpy(portfolio.cash_jpy)
+        buy_coin = buy_jpy / p if p > 0 else 0.0
+        coin_amt = f"{buy_coin:.4f}" if coin == "BTC" else f"{buy_coin:.1f}"
         amt = (
-            f"\n**建议投入：** {fmt_jpy(buy_jpy)}（约 {buy_jpy / p:.1f} XRP）"
+            f"\n**建议投入：** {fmt_jpy(buy_jpy)}（约 {coin_amt} {coin}）"
             if buy_jpy > 0
             else "\n**提示：** 技术信号已出现，但可用现金不足"
         )
-        msg = f"📘【{title}】{reason}"
+        msg = f"📘【{coin} · {title}】{reason}"
         signals.append(
             Signal(
-                key=key,
-                title=title,
+                key=f"{key_prefix}{key}",
+                title=f"{coin} · {title}",
                 console_msg=msg,
                 card_template="green",
                 card_body=(
@@ -1846,6 +1950,8 @@ def detect_signals(
                     f"**MACD 柱：** {tech.macd_hist:+.2f} · 量比 {book.volume_ratio:.1f}×"
                 ),
                 color=f"{Fore.GREEN}{Style.BRIGHT}",
+                market=market_tag,
+                lark_pair_label=lark_label,
             )
         )
 
@@ -1853,15 +1959,18 @@ def detect_signals(
         key: str, title: str, reason: str, *, full_exit: bool = False
     ) -> None:
         if full_exit:
-            amt = f"\n**建议：** 平掉剩余 {portfolio.xrp_quantity:,.0f} XRP"
+            amt = f"\n**建议：** 平掉剩余 {_qty_str(holdings)} {coin}"
         else:
-            sell_qty = portfolio.xrp_quantity * DCA_FRACTION
-            amt = f"\n**建议卖出：** 约 {sell_qty:,.0f} XRP（{fmt_jpy(sell_qty * p)}，分批 1/3）"
-        msg = f"📘【{title}】{reason}"
+            sell_qty = holdings * DCA_FRACTION
+            amt = (
+                f"\n**建议卖出：** 约 {_qty_str(sell_qty)} {coin}"
+                f"（{fmt_jpy(sell_qty * p)}，分批 1/3）"
+            )
+        msg = f"📘【{coin} · {title}】{reason}"
         signals.append(
             Signal(
-                key=key,
-                title=title,
+                key=f"{key_prefix}{key}",
+                title=f"{coin} · {title}",
                 console_msg=msg,
                 card_template="orange" if full_exit else "blue",
                 card_body=(
@@ -1869,6 +1978,8 @@ def detect_signals(
                     f"**价格：** {fmt_jpy(p)} · ADX {book.adx:.0f} · 实体 MA{BODY_MA_PERIOD} {fmt_jpy(book.body_ma)}"
                 ),
                 color=f"{Fore.YELLOW if full_exit else Fore.CYAN}{Style.BRIGHT}",
+                market=market_tag,
+                lark_pair_label=lark_label,
             )
         )
 
@@ -1916,7 +2027,7 @@ def detect_signals(
             full_exit=True,
         )
 
-    if plan.recovery_gap <= 0:
+    if market == XRP_MARKET and plan.recovery_gap <= 0:
         msg = f"🎉【回本】总资产已达 {fmt_jpy(plan.total_assets)}，超过投入目标！"
         signals.append(
             Signal(
@@ -1930,6 +2041,8 @@ def detect_signals(
                     f"**总盈亏：** {fmt_jpy(portfolio.pnl(p))}"
                 ),
                 color=f"{Fore.YELLOW}{Style.BRIGHT}",
+                market="XRP",
+                lark_pair_label=PAIR_LABEL,
             )
         )
 
@@ -1958,7 +2071,7 @@ def send_lark_card(signal: Signal, snapshot: MarketSnapshot) -> None:
                 "template": signal.card_template,
                 "title": {
                     "tag": "plain_text",
-                    "content": f"📊 {PAIR_LABEL} · {signal.title}",
+                    "content": f"📊 {signal.lark_pair_label} · {signal.title}",
                 },
             },
             "elements": [
@@ -1996,6 +2109,7 @@ def push_signals(
     signals: list[Signal],
     snapshot: MarketSnapshot,
     cooldown: AlertCooldown,
+    snapshots_by_market: dict[str, MarketSnapshot] | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     if is_quiet_hours():
@@ -2017,7 +2131,10 @@ def push_signals(
             )
             continue
         try:
-            send_lark_card(signal, snapshot)
+            snap = snapshot
+            if snapshots_by_market:
+                snap = snapshots_by_market.get(signal.market, snapshot)
+            send_lark_card(signal, snap)
             cooldown.mark_sent(signal.key)
             results.append(
                 {"key": signal.key, "title": signal.title, "status": "sent"}
@@ -2039,41 +2156,97 @@ def push_signals(
     return results
 
 
+def _run_market_pipeline(
+    market: MarketSpec,
+    portfolio: Portfolio,
+) -> dict[str, Any]:
+    snapshot, daily = build_snapshot(market)
+    cycle = analyze_cycle(daily, snapshot.price)
+    technical = analyze_technicals(snapshot)
+    use_cycle = _plan_uses_cycle(market)
+    book = analyze_book_strategies(
+        daily, snapshot, portfolio, cycle, market, use_cycle_targets=use_cycle
+    )
+    trend = build_trend_context(market.label, snapshot, cycle, technical, book)
+    plan = build_recovery_plan(
+        snapshot, portfolio, cycle, technical, book, market=market
+    )
+    current_action = build_current_action(snapshot, portfolio, plan, market)
+    advice = generate_trade_advice(snapshot, portfolio, plan, market=market)
+    signals = detect_signals(snapshot, portfolio, plan, market)
+    chart_data = build_chart_data(daily, cycle if use_cycle else None)
+    return {
+        "market": market,
+        "snapshot": snapshot,
+        "daily": daily,
+        "cycle": cycle,
+        "technical": technical,
+        "book": book,
+        "trend": trend,
+        "recovery_plan": plan,
+        "current_action": current_action,
+        "advice": advice,
+        "signals": signals,
+        "chart_data": chart_data,
+    }
+
+
 def run_monitor_cycle(
     cooldown: AlertCooldown | None = None,
     portfolio: Portfolio | None = None,
 ) -> dict[str, Any]:
     cd = cooldown or AlertCooldown(ALERT_COOLDOWN_SECONDS)
     pf = portfolio or load_portfolio()
-    snapshot, daily = build_snapshot(XRP_MARKET)
-    btc = build_btc_trend_context()
-    cycle = analyze_cycle(daily, snapshot.price)
-    technical = analyze_technicals(snapshot)
-    book = analyze_book_strategies(daily, snapshot, pf, cycle)
-    xrp_trend = build_trend_context(XRP_MARKET.label, snapshot, cycle, technical, book)
-    plan = build_recovery_plan(snapshot, pf, cycle, technical, book)
-    current_action = build_current_action(snapshot, pf, plan, XRP_MARKET)
-    advice = generate_trade_advice(snapshot, pf, plan)
-    signals = detect_signals(snapshot, pf, plan)
-    push_results = push_signals(signals, snapshot, cd)
-    return {
-        "snapshot": snapshot,
-        "daily": daily,
-        "btc_trend": btc,
-        "xrp_trend": xrp_trend,
+    xrp = _run_market_pipeline(XRP_MARKET, pf)
+    btc_pipe: dict[str, Any] | None = None
+    try:
+        btc_pipe = _run_market_pipeline(BTC_MARKET, pf)
+    except requests.RequestException:
+        btc_pipe = None
+
+    signals = list(xrp["signals"])
+    snapshots_by_market = {"XRP": xrp["snapshot"]}
+    if btc_pipe is not None:
+        signals.extend(btc_pipe["signals"])
+        snapshots_by_market["BTC"] = btc_pipe["snapshot"]
+
+    push_results = push_signals(
+        signals, xrp["snapshot"], cd, snapshots_by_market=snapshots_by_market
+    )
+
+    result: dict[str, Any] = {
+        "snapshot": xrp["snapshot"],
+        "daily": xrp["daily"],
+        "btc_trend": btc_pipe["trend"] if btc_pipe else None,
+        "xrp_trend": xrp["trend"],
         "portfolio": pf,
-        "cycle": cycle,
-        "technical": technical,
-        "book": book,
-        "recovery_plan": plan,
-        "current_action": current_action,
-        "advice": advice,
-        "chart_data": build_chart_data(daily, cycle),
+        "cycle": xrp["cycle"],
+        "technical": xrp["technical"],
+        "book": xrp["book"],
+        "recovery_plan": xrp["recovery_plan"],
+        "current_action": xrp["current_action"],
+        "advice": xrp["advice"],
+        "chart_data": xrp["chart_data"],
         "signals": signals,
         "push_results": push_results,
         "cooldown": cd,
         "updated_at": now_local(),
     }
+    if btc_pipe is not None:
+        result.update(
+            {
+                "btc_snapshot": btc_pipe["snapshot"],
+                "btc_daily": btc_pipe["daily"],
+                "btc_technical": btc_pipe["technical"],
+                "btc_book": btc_pipe["book"],
+                "btc_recovery_plan": btc_pipe["recovery_plan"],
+                "btc_current_action": btc_pipe["current_action"],
+                "btc_advice": btc_pipe["advice"],
+                "btc_chart_data": btc_pipe["chart_data"],
+                "btc_signals": btc_pipe["signals"],
+            }
+        )
+    return result
 
 
 def print_advice(advice: list[TradeAdvice]) -> None:

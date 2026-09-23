@@ -187,6 +187,7 @@ def apply_streamlit_secrets() -> None:
             "FEISHU_SECRET",
             "APP_TIMEZONE",
             "HOLDINGS_XRP",
+            "HOLDINGS_BTC",
             "AVAILABLE_JPY",
             "TARGET_JPY",
         ):
@@ -206,6 +207,7 @@ def init_session_state() -> None:
     if "_portfolio_initialized" not in st.session_state:
         pf = monitor.load_persisted_portfolio()
         st.session_state.holdings_xrp = float(pf.xrp_quantity)
+        st.session_state.holdings_btc = float(pf.btc_quantity)
         st.session_state.available_jpy = float(pf.cash_jpy)
         st.session_state.target_jpy = float(pf.target_jpy)
         st.session_state._portfolio_initialized = True
@@ -213,6 +215,7 @@ def init_session_state() -> None:
 
 def sync_portfolio_state(portfolio: monitor.Portfolio) -> None:
     st.session_state.holdings_xrp = float(portfolio.xrp_quantity)
+    st.session_state.holdings_btc = float(portfolio.btc_quantity)
     st.session_state.available_jpy = float(portfolio.cash_jpy)
     st.session_state.target_jpy = float(portfolio.target_jpy)
     monitor.save_persisted_portfolio(portfolio)
@@ -228,6 +231,7 @@ def get_portfolio() -> monitor.Portfolio:
         xrp_quantity=st.session_state.holdings_xrp,
         cash_jpy=st.session_state.available_jpy,
         target_jpy=st.session_state.target_jpy,
+        btc_quantity=float(st.session_state.get("holdings_btc", 0.0)),
     )
 
 
@@ -242,9 +246,13 @@ def append_alert_log(message: str, level: str = "info") -> None:
 def _fmt_qty(value: float, unit: str) -> str:
     if value <= 0:
         return "—"
+    if unit == "JPY":
+        return monitor.fmt_jpy(value)
+    if unit == "BTC":
+        return f"{value:,.4f} {unit}"
     if unit == "XRP":
         return f"{value:,.1f} {unit}"
-    return f"{monitor.fmt_jpy(value)}"
+    return f"{value:,.4f} {unit}"
 
 
 def render_current_action(
@@ -254,8 +262,9 @@ def render_current_action(
 ) -> None:
     css_class, badge_text = ACTION_BADGE.get(action.action, ("wait", "⏸ 等待"))
     buy_jpy = _fmt_qty(action.buy_jpy, "JPY")
-    buy_xrp = _fmt_qty(action.buy_xrp, "XRP")
-    sell_xrp = _fmt_qty(action.sell_xrp, "XRP")
+    coin = action.asset or "XRP"
+    buy_coin = _fmt_qty(action.buy_xrp, coin)
+    sell_coin = _fmt_qty(action.sell_xrp, coin)
     sell_jpy = _fmt_qty(action.sell_jpy, "JPY")
 
     buy_cls = "" if action.buy_jpy > 0 else " dim"
@@ -291,12 +300,12 @@ def render_current_action(
       <div class="action-metric-value{buy_cls}">{buy_jpy}</div>
     </div>
     <div class="action-metric">
-      <div class="action-metric-label">买入数量</div>
-      <div class="action-metric-value{buy_xrp_cls}">{buy_xrp}</div>
+      <div class="action-metric-label">买入数量 ({coin})</div>
+      <div class="action-metric-value{buy_xrp_cls}">{buy_coin}</div>
     </div>
     <div class="action-metric">
-      <div class="action-metric-label">卖出数量</div>
-      <div class="action-metric-value{sell_xrp_cls}">{sell_xrp}</div>
+      <div class="action-metric-label">卖出数量 ({coin})</div>
+      <div class="action-metric-value{sell_xrp_cls}">{sell_coin}</div>
     </div>
     <div class="action-metric">
       <div class="action-metric-label">卖出金额</div>
@@ -341,6 +350,14 @@ def render_sidebar_portfolio() -> None:
             step=1.0,
             format="%.0f",
         )
+        btc = st.number_input(
+            "BTC 持仓（枚）",
+            min_value=0.0,
+            value=float(pf.btc_quantity),
+            step=0.0001,
+            format="%.4f",
+            help="用于 BTC 书本止盈/止损与操作卡片",
+        )
         cash = st.number_input(
             "日元可支配资产",
             min_value=0.0,
@@ -361,12 +378,14 @@ def render_sidebar_portfolio() -> None:
             sync_portfolio_state(
                 monitor.Portfolio(
                     xrp_quantity=xrp,
+                    btc_quantity=btc,
                     cash_jpy=cash,
                     target_jpy=target,
                 )
             )
             append_alert_log(
-                f"持仓已保存：{xrp:,.0f} XRP · 现金 {monitor.fmt_jpy(cash)} · 目标 {monitor.fmt_jpy(target)}",
+                f"持仓已保存：{xrp:,.0f} XRP · {btc:.4f} BTC · 现金 {monitor.fmt_jpy(cash)} · "
+                f"目标 {monitor.fmt_jpy(target)}",
                 "success",
             )
             st.rerun()
@@ -375,8 +394,9 @@ def render_sidebar_portfolio() -> None:
     saved_at = monitor.portfolio_saved_at()
     saved_hint = f" · 保存于 {saved_at}" if saved_at else ""
     st.caption(
-        f"当前生效：{saved.xrp_quantity:,.0f} XRP · {monitor.fmt_jpy(saved.cash_jpy)} · "
-        f"低吸建议 {monitor.fmt_jpy(monitor.suggest_dca_jpy(saved.cash_jpy))}{saved_hint}"
+        f"当前生效：{saved.xrp_quantity:,.0f} XRP · {saved.btc_quantity:.4f} BTC · "
+        f"{monitor.fmt_jpy(saved.cash_jpy)} · "
+        f"单次低吸建议 {monitor.fmt_jpy(monitor.suggest_dca_jpy(saved.cash_jpy))}{saved_hint}"
     )
     if st.button("重置为 Secrets / .env 默认值", use_container_width=True):
         reset_portfolio_from_config()
@@ -473,17 +493,24 @@ def render_trend_summary(
     price_label: str = "价格",
     strength_label: str = "趋势强度",
     operation_note: str | None = None,
+    show_cycle: bool = True,
 ) -> None:
     """BTC / XRP 共用的趋势判定面板。"""
     trend_icon = {"上涨": "📈", "下跌": "📉", "震荡": "↔️"}.get(ctx.trend, "—")
-    cols = st.columns(4)
+    cols = st.columns(4 if show_cycle else 3)
     cols[0].metric(price_label, monitor.fmt_jpy(ctx.snapshot.price))
     cols[1].metric("趋势判定", f"{trend_icon} {ctx.trend}", f"{strength_label} {ctx.xrp_bias:+.2f}")
-    cols[2].metric("4年阶段", ctx.cycle.phase, f"{ctx.cycle.position_pct:.0f}% 位置")
-    cols[3].metric(
-        "30日区间",
-        f"{monitor.fmt_jpy(ctx.snapshot.low_30d)} – {monitor.fmt_jpy(ctx.snapshot.high_30d)}",
-    )
+    if show_cycle:
+        cols[2].metric("4年阶段", ctx.cycle.phase, f"{ctx.cycle.position_pct:.0f}% 位置")
+        cols[3].metric(
+            "30日区间",
+            f"{monitor.fmt_jpy(ctx.snapshot.low_30d)} – {monitor.fmt_jpy(ctx.snapshot.high_30d)}",
+        )
+    else:
+        cols[2].metric(
+            "30日区间",
+            f"{monitor.fmt_jpy(ctx.snapshot.low_30d)} – {monitor.fmt_jpy(ctx.snapshot.high_30d)}",
+        )
 
     note = operation_note or ""
     if ctx.trend == "上涨":
@@ -495,39 +522,99 @@ def render_trend_summary(
     st.caption(f"趋势依据：{ctx.trend_detail}")
 
 
-def render_btc_section(btc: monitor.AssetTrendContext | None) -> None:
+def render_coin_portfolio(
+    coin: str,
+    portfolio: monitor.Portfolio,
+    snapshot: monitor.MarketSnapshot,
+    plan: monitor.RecoveryPlan,
+) -> None:
+    st.subheader("资产概况")
+    if coin == "BTC":
+        qty = portfolio.btc_quantity
+        value = portfolio.btc_value(snapshot.price)
+        qty_label = f"{qty:,.4f} BTC"
+    else:
+        qty = portfolio.xrp_quantity
+        value = portfolio.xrp_value(snapshot.price)
+        qty_label = f"{qty:,.0f} XRP"
+    cols = st.columns(4)
+    cols[0].metric(f"{coin} 持仓", qty_label, monitor.fmt_jpy(value))
+    cols[1].metric("日元现金（共用）", monitor.fmt_jpy(portfolio.cash_jpy))
+    cols[2].metric(
+        f"{coin} 侧估算总资产",
+        monitor.fmt_jpy(plan.total_assets),
+        f"目标 {monitor.fmt_jpy(portfolio.target_jpy)}（全局）",
+    )
+    cols[3].metric("单次低吸建议", monitor.fmt_jpy(plan.dca_buy_jpy))
+
+
+def render_btc_section(
+    btc_trend: monitor.AssetTrendContext | None,
+    btc_snapshot: monitor.MarketSnapshot | None,
+    btc_current_action: monitor.CurrentAction | None,
+    updated_at: datetime,
+    btc_technical: monitor.TechnicalContext | None,
+    btc_book: monitor.BookStrategyContext | None,
+    portfolio: monitor.Portfolio,
+    btc_plan: monitor.RecoveryPlan | None,
+    btc_advice: list[monitor.TradeAdvice] | None,
+    btc_chart_data,
+    btc_signals: list[monitor.Signal] | None,
+    cooldown: monitor.AlertCooldown,
+) -> None:
     with st.container(border=True):
         _panel_banner(
-            "🟠 ① BTC/JPY 大盘预测",
-            "与 XRP 相同技术分析 + 书本策略 · 仅联动参考，不直接下单、不推送 Lark",
+            "🟠 ① BTC/JPY 操作",
+            "与 XRP 相同：RSI / 书本策略 / 操作卡片 / Lark（不含 4 年周期表）",
             "#f7931a",
         )
 
-        if btc is None:
-            st.warning("BTC 数据暂不可用，请以 XRP 自身信号为准。")
+        if btc_trend is None or btc_snapshot is None:
+            st.warning("BTC 数据暂不可用。")
             return
 
         render_trend_summary(
-            btc,
+            btc_trend,
             price_label="BTC 价格",
-            strength_label="联动",
-            operation_note=monitor.btc_xrp_linkage_note(btc),
+            strength_label="强度",
+            operation_note=monitor.btc_trend_operation_note(btc_trend),
+            show_cycle=False,
         )
 
-        render_market_technicals(
-            "BTC 技术指标",
-            btc.technical,
-            btc.snapshot,
-            btc.book,
-            book_label="BTC 书本策略（参考）",
-            book_hint="相同逻辑已计算；持仓类信号（止盈/止损）因无 BTC 持仓通常不触发。",
-        )
+        if btc_current_action is not None:
+            render_current_action(btc_current_action, updated_at, btc_snapshot)
+            render_action_trend_note(
+                btc_trend, btc_current_action, btc_book, asset_label="BTC"
+            )
+
+        if btc_technical is not None:
+            render_market_technicals(
+                "BTC 技术指标 · 操作依据",
+                btc_technical,
+                btc_snapshot,
+                btc_book,
+                book_label="BTC 书本策略（触发 Lark / 操作卡片）",
+                book_hint="与 XRP 相同逻辑；请在侧边栏填写 BTC 持仓以启用止盈/止损。",
+            )
+
+        if btc_plan is not None:
+            render_coin_portfolio("BTC", portfolio, btc_snapshot, btc_plan)
+            render_recovery_plan(btc_plan, title_prefix="BTC ")
+            render_swing_plan(btc_plan, btc_snapshot.price, coin="BTC", cycle_table=False)
+        if btc_advice:
+            render_trade_advice(btc_advice)
+        if btc_chart_data is not None:
+            render_price_chart(btc_chart_data, title="BTC 价格走势", show_cycle_lines=False)
+        if btc_signals:
+            render_signals(btc_signals, cooldown, section_title="BTC Lark 推送")
 
 
 def render_action_trend_note(
     xrp_trend: monitor.AssetTrendContext | None,
     current_action: monitor.CurrentAction,
     book: monitor.BookStrategyContext | None,
+    *,
+    asset_label: str = "XRP",
 ) -> None:
     """趋势判定与操作卡片不一致时说明原因。"""
     if xrp_trend is None:
@@ -543,8 +630,8 @@ def render_action_trend_note(
         )
     elif trend == "下跌" and act == "买入":
         st.warning(
-            f"📌 **趋势 vs 操作**：XRP 趋势偏空，但仍出现买入信号。"
-            f" 请结合 BTC 与书本条件谨慎执行。\n\n{current_action.reason}"
+            f"📌 **趋势 vs 操作**：{asset_label} 趋势偏空，但仍出现买入信号。"
+            f" 请结合书本条件谨慎执行。\n\n{current_action.reason}"
         )
     elif act == "等待" and trend in ("上涨", "下跌"):
         st.caption(
@@ -604,10 +691,10 @@ def render_xrp_section(
             st.caption("⚠️ XRP 书本策略未加载：请同步最新 `xrp_monitor.py`。")
         if cycle is not None:
             render_cycle_context(cycle, snapshot)
-        render_portfolio(portfolio, snapshot, plan)
+        render_coin_portfolio("XRP", portfolio, snapshot, plan)
         render_recovery_plan(plan)
         if cycle is not None:
-            render_swing_plan(plan, snapshot.price)
+            render_swing_plan(plan, snapshot.price, coin="XRP", cycle_table=True)
         render_trade_advice(advice)
         render_price_chart(chart_data)
         render_signals(signals, cooldown)
@@ -630,8 +717,8 @@ def render_cycle_context(cycle: monitor.CycleContext, snapshot: monitor.MarketSn
     st.caption(f"{cycle.phase_detail} · 以下价位仅供挂单参考，须等 RSI 等技术信号确认后再操作")
 
 
-def render_recovery_plan(plan: monitor.RecoveryPlan) -> None:
-    st.subheader("回本进度")
+def render_recovery_plan(plan: monitor.RecoveryPlan, *, title_prefix: str = "") -> None:
+    st.subheader(f"{title_prefix}回本进度")
     st.progress(
         plan.recovery_pct,
         text=f"当前 {monitor.fmt_jpy(plan.total_assets)} / 目标 {monitor.fmt_jpy(plan.target_jpy)} · 还差 {monitor.fmt_jpy(plan.recovery_gap)}",
@@ -642,9 +729,16 @@ def render_recovery_plan(plan: monitor.RecoveryPlan) -> None:
     cols[2].metric("单次波段预期", monitor.fmt_jpy(plan.swing_cycle_profit), f"基于 {monitor.fmt_jpy(plan.dca_buy_jpy)} 低吸 +12%")
 
 
-def render_swing_plan(plan: monitor.RecoveryPlan, current_price: float) -> None:
-    st.subheader("周期参考价位表（需 RSI 确认）")
-    st.caption("表中为历史统计的挂单参考位，**不等于立即买入/卖出**。")
+def render_swing_plan(
+    plan: monitor.RecoveryPlan,
+    current_price: float,
+    *,
+    coin: str = "XRP",
+    cycle_table: bool = True,
+) -> None:
+    title = "周期参考价位表（需 RSI 确认）" if cycle_table else "30 日波段参考价位（需 RSI 确认）"
+    st.subheader(title)
+    st.caption("表中为挂单参考位，**不等于立即买入/卖出**。")
     col_buy, col_sell = st.columns(2)
 
     with col_buy:
@@ -653,11 +747,16 @@ def render_swing_plan(plan: monitor.RecoveryPlan, current_price: float) -> None:
             for step in plan.buy_steps:
                 near = abs(current_price - step.trigger_price) / step.trigger_price < 0.03
                 marker = "📍 " if near else ""
+                qty_line = (
+                    f"{step.amount_xrp:,.4f} {coin}"
+                    if coin == "BTC"
+                    else f"{step.amount_xrp:,.1f} {coin}"
+                )
                 st.markdown(
                     f"""
 <div class="plan-step-card buy-step">
   <div class="plan-step-price">{marker}{monitor.fmt_jpy(step.trigger_price)} · {step.trigger_label}</div>
-  <div class="plan-step-qty">{step.amount_desc} · {step.amount_xrp:,.1f} XRP</div>
+  <div class="plan-step-qty">{step.amount_desc} · {qty_line}</div>
   <div style="font-size:0.85rem;opacity:0.85;margin-top:0.3rem;">{step.result_desc}</div>
 </div>
                     """,
@@ -704,21 +803,38 @@ def render_trade_advice(advice: list[monitor.TradeAdvice]) -> None:
             st.info(f"{label}\n\n{body}")
 
 
-def render_price_chart(chart_data) -> None:
+def render_price_chart(
+    chart_data,
+    *,
+    title: str = "XRP 价格走势",
+    show_cycle_lines: bool = True,
+) -> None:
     if chart_data is None or chart_data.empty:
         return
-    st.markdown("#### XRP 价格走势")
+    st.markdown(f"#### {title}")
     st.line_chart(chart_data, height=240)
-    if "p25" in chart_data.columns:
+    if show_cycle_lines and chart_data is not None and "p25" in chart_data.columns:
         st.caption("参考线：4年 25% / 75% 分位（周期低吸/高抛带）")
 
 
-def render_signals(signals: list[monitor.Signal], cooldown: monitor.AlertCooldown) -> None:
+def _signal_style(key: str) -> tuple[str, str]:
+    if key in SIGNAL_STYLE:
+        return SIGNAL_STYLE[key]
+    base = key.removeprefix("btc_")
+    return SIGNAL_STYLE.get(base, ("info", key))
+
+
+def render_signals(
+    signals: list[monitor.Signal],
+    cooldown: monitor.AlertCooldown,
+    *,
+    section_title: str = "XRP Lark 推送",
+) -> None:
     if not signals:
         return
-    st.markdown("#### XRP Lark 推送")
+    st.markdown(f"#### {section_title}")
     for signal in signals:
-        style, _ = SIGNAL_STYLE.get(signal.key, ("info", signal.title))
+        style, _ = _signal_style(signal.key)
         remain = cooldown.remaining_hours(signal.key)
         suffix = f"（冷却 {remain:.1f}h）" if remain > 0 else ""
         message = f"{signal.console_msg}{suffix}"
@@ -840,13 +956,32 @@ def render_monitor_panel(refresh_seconds: int) -> None:
     for signal in signals:
         toast_key = f"ui_{signal.key}"
         if toast_key not in st.session_state.toast_keys:
-            st.toast(signal.console_msg, icon="🔔")
+            icon = "🟠" if signal.key.startswith("btc_") or getattr(signal, "market", "") == "BTC" else "🔔"
+            st.toast(signal.console_msg, icon=icon)
             st.session_state.toast_keys.add(toast_key)
 
-    # ── ① BTC 大盘（上）──────────────────────────────────────
-    render_btc_section(btc)
+    btc_signals = [
+        s for s in signals if getattr(s, "market", "XRP") == "BTC" or s.key.startswith("btc_")
+    ]
+    xrp_signals = [s for s in signals if s not in btc_signals]
 
-    # ── ② XRP 操作（下）──────────────────────────────────────
+    # ── ① BTC（上）────────────────────────────────────────────
+    render_btc_section(
+        btc,
+        result.get("btc_snapshot"),
+        result.get("btc_current_action"),
+        updated_at,
+        result.get("btc_technical"),
+        result.get("btc_book") or (btc.book if btc else None),
+        portfolio,
+        result.get("btc_recovery_plan"),
+        result.get("btc_advice"),
+        result.get("btc_chart_data"),
+        btc_signals,
+        cooldown,
+    )
+
+    # ── ② XRP（下）────────────────────────────────────────────
     render_xrp_section(
         snapshot,
         xrp_trend,
@@ -860,7 +995,7 @@ def render_monitor_panel(refresh_seconds: int) -> None:
         plan,
         advice,
         chart_data,
-        signals,
+        xrp_signals,
         cooldown,
     )
 
