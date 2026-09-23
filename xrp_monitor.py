@@ -1580,14 +1580,13 @@ def generate_trade_advice(
 
     if tech.buy_triggered and dca_jpy > 0:
         strength = _cycle_amount_scale(cycle, tech.buy_strength)
-        amount, strength = apply_btc_bias_to_buy(dca_jpy * strength, strength, btc)
-        btc_note = btc_xrp_linkage_note(btc)
+        amount = dca_jpy * strength
         advice.append(
             TradeAdvice(
                 action="买入",
                 strength="强烈建议" if strength >= 0.9 else "建议",
                 title="技术信号 · 执行买入",
-                reason=tech.buy_reason + (f" · {btc_note}" if btc_note else ""),
+                reason=tech.buy_reason,
                 detail=(
                     f"建议投入 {fmt_jpy(amount)} 买入约 {amount / p:.1f} XRP。"
                     f"周期参考：{cycle.phase}，可挂低于现价位 "
@@ -1607,18 +1606,15 @@ def generate_trade_advice(
         )
 
     if tech.sell_triggered:
-        fraction = SWING_SELL_FRACTION * tech.sell_strength
-        fraction, sell_strength = apply_btc_bias_to_sell(
-            max(SWING_SELL_FRACTION * 0.5, fraction), tech.sell_strength, btc
-        )
+        fraction = max(SWING_SELL_FRACTION * 0.5, SWING_SELL_FRACTION * tech.sell_strength)
         sell_qty = portfolio.xrp_quantity * fraction
-        btc_note = btc_xrp_linkage_note(btc)
+        sell_strength = tech.sell_strength
         advice.append(
             TradeAdvice(
                 action="卖出",
                 strength="建议" if sell_strength >= 0.75 else "可考虑",
                 title="技术信号 · 分批卖出",
-                reason=tech.sell_reason + (f" · {btc_note}" if btc_note else ""),
+                reason=tech.sell_reason,
                 detail=(
                     f"建议卖出约 {sell_qty:,.0f} XRP（{fmt_jpy(sell_qty * p)}）。"
                     f"周期参考卖点 {fmt_jpy(cycle.p75_price)} / {fmt_jpy(cycle.range_high)}。"
@@ -1693,39 +1689,30 @@ def build_current_action(
 
     # 分批止盈 1/3（ADX+Stoch 长上影 / 目标位）
     if book.partial_take_profit or book.partial_profit_at_target:
-        sell_qty = portfolio.xrp_quantity * DCA_FRACTION
+        sell_qty = holdings * DCA_FRACTION
         reason = (
             book.sell_alerts[0]
             if book.sell_alerts
             else "书本策略 · 分批止盈"
         )
-        return CurrentAction(
+        return _act(
             action="卖出",
-            title="书本策略 · 分批 1/3 止盈",
+            title=f"{coin} · 书本策略 · 分批 1/3 止盈",
             reason=reason,
-            buy_jpy=0.0,
-            buy_xrp=0.0,
             sell_xrp=sell_qty,
             sell_jpy=sell_qty * p,
-            next_buy_price=nb,
-            next_sell_price=ns,
             trigger_price=p,
         )
 
     if tech.sell_triggered:
         fraction = max(SWING_SELL_FRACTION * 0.5, SWING_SELL_FRACTION * tech.sell_strength)
-        fraction, _ = apply_btc_bias_to_sell(fraction, tech.sell_strength, btc)
-        sell_qty = portfolio.xrp_quantity * fraction
-        return CurrentAction(
+        sell_qty = holdings * fraction
+        return _act(
             action="卖出",
-            title="技术信号 · 分批卖出",
-            reason=f"{tech.sell_reason} · 周期参考 {cycle.phase}{btc_suffix}",
-            buy_jpy=0.0,
-            buy_xrp=0.0,
+            title=f"{coin} · 技术信号 · 分批卖出",
+            reason=f"{tech.sell_reason} · 周期参考 {cycle.phase}",
             sell_xrp=sell_qty,
             sell_jpy=sell_qty * p,
-            next_buy_price=nb,
-            next_sell_price=ns,
             trigger_price=p,
         )
 
@@ -1738,84 +1725,55 @@ def build_current_action(
     )
     if book_buy and dca_jpy > 0:
         reason = " · ".join(book.buy_alerts) if book.buy_alerts else "书本策略买点"
-        amount, _ = apply_btc_bias_to_buy(dca_jpy, 0.55, btc)
-        title = "书本策略 · 顺势买入"
+        amount = dca_jpy
+        title = f"{coin} · 书本策略 · 顺势买入"
         if book.scale_in_buy:
-            title = "书本策略 · 顺势加仓 1/3"
+            title = f"{coin} · 书本策略 · 顺势加仓 1/3"
         elif book.selling_climax:
-            title = "书本策略 · Selling Climax 抄底"
+            title = f"{coin} · 书本策略 · Selling Climax 抄底"
         elif book.macd_bullish_divergence:
-            title = "书本策略 · MACD 底背离"
+            title = f"{coin} · 书本策略 · MACD 底背离"
         elif book.trend_follow_buy:
-            title = "书本策略 · ADX 强趋势追买"
-        return CurrentAction(
+            title = f"{coin} · 书本策略 · ADX 强趋势追买"
+        return _act(
             action="买入",
             title=title,
-            reason=f"{reason}{btc_suffix}",
+            reason=reason,
             buy_jpy=amount,
             buy_xrp=amount / p if p > 0 else 0.0,
-            sell_xrp=0.0,
-            sell_jpy=0.0,
-            next_buy_price=nb,
-            next_sell_price=ns,
             trigger_price=p,
         )
 
     if book_buy:
-        return CurrentAction(
+        return _act(
             action="等待",
-            title="书本信号 · 现金不足",
+            title=f"{coin} · 书本信号 · 现金不足",
             reason=" · ".join(book.buy_alerts),
-            buy_jpy=0.0,
-            buy_xrp=0.0,
-            sell_xrp=0.0,
-            sell_jpy=0.0,
-            next_buy_price=nb,
-            next_sell_price=ns,
-            trigger_price=None,
         )
 
     if tech.buy_triggered and dca_jpy > 0:
         strength = _cycle_amount_scale(cycle, tech.buy_strength)
-        amount, _ = apply_btc_bias_to_buy(dca_jpy * strength, strength, btc)
-        return CurrentAction(
+        amount = dca_jpy * strength
+        return _act(
             action="买入",
-            title="技术信号 · 执行买入",
-            reason=f"{tech.buy_reason} · 周期参考 {cycle.phase}{btc_suffix}",
+            title=f"{coin} · 技术信号 · 执行买入",
+            reason=f"{tech.buy_reason} · 周期参考 {cycle.phase}",
             buy_jpy=amount,
             buy_xrp=amount / p if p > 0 else 0.0,
-            sell_xrp=0.0,
-            sell_jpy=0.0,
-            next_buy_price=nb,
-            next_sell_price=ns,
             trigger_price=p,
         )
 
     if tech.buy_triggered:
-        return CurrentAction(
+        return _act(
             action="等待",
-            title="技术达标 · 现金不足",
+            title=f"{coin} · 技术达标 · 现金不足",
             reason=tech.buy_reason,
-            buy_jpy=0.0,
-            buy_xrp=0.0,
-            sell_xrp=0.0,
-            sell_jpy=0.0,
-            next_buy_price=nb,
-            next_sell_price=ns,
-            trigger_price=None,
         )
 
-    return CurrentAction(
+    return _act(
         action="等待",
-        title="技术未触发 · 持有观望",
+        title=f"{coin} · 技术未触发 · 持有观望",
         reason=f"RSI {tech.rsi:.0f}（{tech.rsi_zone}）· 周期 {cycle.phase} 仅供参考",
-        buy_jpy=0.0,
-        buy_xrp=0.0,
-        sell_xrp=0.0,
-        sell_jpy=0.0,
-        next_buy_price=nb,
-        next_sell_price=ns,
-        trigger_price=None,
     )
 
 
@@ -2094,8 +2052,8 @@ def run_monitor_cycle(
     book = analyze_book_strategies(daily, snapshot, pf, cycle)
     xrp_trend = build_trend_context(XRP_MARKET.label, snapshot, cycle, technical, book)
     plan = build_recovery_plan(snapshot, pf, cycle, technical, book)
-    current_action = build_current_action(snapshot, pf, plan, btc)
-    advice = generate_trade_advice(snapshot, pf, plan, btc)
+    current_action = build_current_action(snapshot, pf, plan, XRP_MARKET)
+    advice = generate_trade_advice(snapshot, pf, plan)
     signals = detect_signals(snapshot, pf, plan)
     push_results = push_signals(signals, snapshot, cd)
     return {
